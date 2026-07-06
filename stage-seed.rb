@@ -1,0 +1,221 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# host-side: build a curated, path-rewritten seed dir for one box.
+# the launcher mounts ONLY this dir into the box, so history/sessions/other
+# projects' state are never reachable by the sandboxed agent.
+#
+# usage: stage-seed.rb <seed_out_dir>
+
+require "json"
+require "fileutils"
+
+SEED = ARGV[0] or abort "usage: stage-seed.rb <seed_out_dir>"
+
+HOST_HOME = ENV["HOME"]
+BOX_HOME = "/home/discourse"
+AGENT_CONFIG_SKILLS = File.join(HOST_HOME, "workspace/agent-config/skills")
+
+# the box runs the agent with cwd /src, so claude keys project memory under "-src"
+PROJECT_KEY = "-src"
+HOST_MEMORY = File.join(HOST_HOME, ".claude/projects/-Users-natalie-work-discourse-discourse/memory")
+
+# pin the Playwright MCP to the version whose chromium we baked into the image,
+# so @latest can't drift ahead of the baked browser. Passed in via env.
+PLAYWRIGHT_MCP = ENV["DBOX_PLAYWRIGHT_MCP"] # e.g. "@playwright/mcp@0.0.75"
+
+def rewrite(str)
+  str = str.gsub(HOST_HOME, BOX_HOME)
+  if PLAYWRIGHT_MCP && !PLAYWRIGHT_MCP.empty?
+    # Pin the @playwright/mcp version AND force `--browser chromium`: the MCP
+    # defaults to the "chrome" channel (branded Google Chrome), which has no
+    # arm64 Linux build, so it ignores the bundled chromium we baked. We inject
+    # the two args right after the package token (works for both JSON-array and
+    # TOML-array forms, which both use "x", "y"). Skip if --browser already set.
+    add_browser = !str.include?('"--browser"')
+    str = str.gsub(%r{"@playwright/mcp(@[^"]*)?"}) do
+      add_browser ? %("#{PLAYWRIGHT_MCP}", "--browser", "chromium") : %("#{PLAYWRIGHT_MCP}")
+    end
+    # also pin any non-quoted occurrences (e.g. in prose/help), just version
+    str = str.gsub(%r{@playwright/mcp(@[^"'\s]+)?}, PLAYWRIGHT_MCP)
+  end
+  str
+end
+
+def copy(src, dst)
+  return unless File.exist?(src)
+  FileUtils.mkdir_p(File.dirname(dst))
+  FileUtils.cp_r(src, dst)
+end
+
+def copy_resolved(src, dst)
+  return unless File.exist?(src)
+  FileUtils.mkdir_p(File.dirname(dst))
+  FileUtils.rm_rf(dst)
+  FileUtils.cp_r(File.realpath(src), dst)
+end
+
+def copy_skill_dirs(src_dir, dst_dir, skip: [])
+  return [] unless Dir.exist?(src_dir)
+
+  copied = []
+  Dir.children(src_dir).sort.each do |name|
+    next if skip.include?(name)
+
+    src = File.join(src_dir, name)
+    next unless File.directory?(src)
+
+    copy_resolved(src, File.join(dst_dir, name))
+    copied << name
+  end
+  copied
+end
+
+def write(path, content)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, content)
+end
+
+def split_leading_root_toml(content)
+  lines = content.lines
+  first_table = lines.index { |line| line.match?(/^\s*\[/) } || lines.length
+  [lines[0...first_table].join, lines[first_table..].join]
+end
+
+def root_toml_keys(content)
+  root, = split_leading_root_toml(content)
+  root.lines.filter_map { |line| line[/^\s*([A-Za-z0-9_-]+)\s*=/, 1] }
+end
+
+def prepend_root_toml(content, root)
+  existing_keys = root_toml_keys(content)
+  inserted = []
+
+  root.lines.each do |line|
+    key = line[/^\s*([A-Za-z0-9_-]+)\s*=/, 1]
+    if key
+      next if existing_keys.include?(key)
+
+      existing_keys << key
+    end
+    inserted << line
+  end
+
+  return content unless inserted.any? { |line| line.match?(/^\s*[A-Za-z0-9_-]+\s*=/) }
+
+  lines = content.lines
+  first_table = lines.index { |line| line.match?(/^\s*\[/) } || lines.length
+  lines.insert(first_table, "\n# --- discourse project root config (folded in from repo .codex/config.toml) ---\n", *inserted, "\n")
+  lines.join
+end
+
+FileUtils.rm_rf(SEED)
+FileUtils.mkdir_p(SEED)
+
+claude_seed = File.join(SEED, ".claude")
+codex_seed = File.join(SEED, ".codex")
+agents_seed = File.join(SEED, ".agents")
+mcps_seed = File.join(SEED, ".mcps")
+
+# ---- claude: credentials, agents, plugins -------------------------------
+# On macOS the LIVE oauth token lives in the Keychain; the ~/.claude/.credentials.json
+# file is usually a stale leftover. Prefer the Keychain, fall back to the file.
+def claude_credentials
+  kc = `security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null`
+  return kc unless kc.strip.empty?
+  f = File.join(HOST_HOME, ".claude/.credentials.json")
+  File.exist?(f) ? File.read(f) : nil
+end
+creds = claude_credentials
+if creds
+  write(File.join(claude_seed, ".credentials.json"), creds)
+else
+  warn "stage-seed: no claude credentials found (keychain or file) — box will require login"
+end
+copy(File.join(HOST_HOME, ".claude/agents"), File.join(claude_seed, "agents"))
+copy(File.join(HOST_HOME, ".claude/plugins"), File.join(claude_seed, "plugins"))
+claude_skills = []
+claude_skills.concat(copy_skill_dirs(File.join(HOST_HOME, ".claude/skills"), File.join(claude_seed, "skills")))
+claude_skills.concat(copy_skill_dirs(AGENT_CONFIG_SKILLS, File.join(claude_seed, "skills")))
+claude_skills.uniq!
+
+# ---- claude: settings.json (drop mac-only peon-ping hooks + host paths) --
+settings_path = File.join(HOST_HOME, ".claude/settings.json")
+if File.exist?(settings_path)
+  settings = JSON.parse(File.read(settings_path))
+  settings.delete("hooks")        # all hooks are peon-ping audio (afplay) — useless + 10s timeouts in a linux box
+  settings.delete("permissions")  # mac JetBrains scratch paths — irrelevant in the box
+  write(File.join(claude_seed, "settings.json"), rewrite(JSON.pretty_generate(settings)))
+end
+
+# ---- claude: curated ~/.claude.json (mcpServers + flags only) ------------
+claude_json_path = File.join(HOST_HOME, ".claude.json")
+mcp_servers = {}
+if File.exist?(claude_json_path)
+  host = JSON.parse(File.read(claude_json_path))
+  mcp_servers = host["mcpServers"] || {}
+  # promote the discourse-project-scoped figma server to global so it loads at /src
+  project = (host["projects"] || {})[File.join(HOST_HOME, "work/discourse/discourse")] || {}
+  (project["mcpServers"] || {}).each { |k, v| mcp_servers[k] ||= v }
+end
+curated = {
+  "mcpServers" => mcp_servers,
+  "hasCompletedOnboarding" => true,
+  "projects" => {
+    "/src" => { "hasTrustDialogAccepted" => true, "hasCompletedProjectOnboarding" => true },
+  },
+}
+write(File.join(SEED, ".claude.json"), rewrite(JSON.pretty_generate(curated)))
+
+# ---- mcp profiles --------------------------------------------------------
+mcps_dir = File.join(HOST_HOME, ".mcps")
+if Dir.exist?(mcps_dir)
+  FileUtils.mkdir_p(mcps_seed)
+  Dir.glob(File.join(mcps_dir, "*.json")).each do |f|
+    write(File.join(mcps_seed, File.basename(f)), rewrite(File.read(f)))
+  end
+end
+
+# ---- codex: auth, config (rewritten), rules, skills ----------------------
+copy(File.join(HOST_HOME, ".codex/auth.json"), File.join(codex_seed, "auth.json"))
+copy(File.join(HOST_HOME, ".codex/rules"), File.join(codex_seed, "rules"))
+copy(File.join(HOST_HOME, ".codex/skills/.system"), File.join(codex_seed, "skills/.system"))
+codex_skills = File.join(HOST_HOME, ".agents/skills")
+codex_machine_skills = []
+codex_machine_skills.concat(copy_skill_dirs(codex_skills, File.join(agents_seed, "skills")))
+codex_machine_skills.concat(copy_skill_dirs(AGENT_CONFIG_SKILLS, File.join(agents_seed, "skills")))
+codex_machine_skills.uniq!
+codex_config = File.join(HOST_HOME, ".codex/config.toml")
+if File.exist?(codex_config)
+  content = rewrite(File.read(codex_config))
+  # The discourse MCPs are project-scoped on the host (repo .codex/config.toml),
+  # so the global codex config is lean. The box runs codex at /src and is always
+  # discourse, so fold the repo's project servers into the box's global config.
+  repo_codex = File.join(HOST_HOME, "work/discourse/discourse/.codex/config.toml")
+  if File.exist?(repo_codex)
+    repo_root, repo_tables = split_leading_root_toml(rewrite(File.read(repo_codex)))
+    content = prepend_root_toml(content, repo_root)
+    content += "\n# --- discourse project MCPs (folded in from repo .codex/config.toml) ---\n"
+    content += repo_tables
+  end
+  write(File.join(codex_seed, "config.toml"), content)
+end
+
+# ---- plugins: rewrite host paths in copied config so plugins resolve ------
+# (plugin JSON points at marketplace/repo install dirs by absolute path)
+Dir.glob(File.join(claude_seed, "plugins", "**", "*.json")).each do |f|
+  content = File.read(f)
+  File.write(f, rewrite(content)) if content.include?(HOST_HOME)
+end
+
+# ---- shared memory under the /src project key ----------------------------
+# copied verbatim — memory notes are prose that may legitimately mention host
+# paths, so we do NOT rewrite their contents.
+if Dir.exist?(HOST_MEMORY)
+  copy(HOST_MEMORY, File.join(claude_seed, "projects", PROJECT_KEY, "memory"))
+end
+
+puts "staged seed -> #{SEED}"
+puts "  mcp servers: #{mcp_servers.keys.join(", ")}"
+puts "  claude skills: #{claude_skills.join(", ")}" if claude_skills.any?
+puts "  codex machine skills: #{codex_machine_skills.join(", ")}" if codex_machine_skills.any?

@@ -1,0 +1,20 @@
+# copy-files — files copied into every new box on `d-box new`.
+#
+# One entry per line:
+#   SOURCE                  copy SOURCE to the same path under /src
+#   SOURCE -> DEST          copy SOURCE to DEST
+#
+# SOURCE: relative paths resolve against the repo ($DBOX_REPO); ~ = your host home;
+#         absolute paths work too. The LIVE file is copied at box-creation time,
+#         so it's always current (no stale snapshots).
+# DEST:   /src/... for the working dir, ~/... for the box's home, or any absolute
+#         path inside the box. Omit it to default to /src/<source path>.
+#
+# Lines starting with # and blank lines are ignored.
+#
+# Examples:
+#   ~/dotfiles/.vimrc       -> ~/.vimrc
+#   ~/notes/scratch.md      -> /src/NOTES.md
+#   config/local.yml                       # -> /src/config/local.yml
+
+AI-AGENTS.md
