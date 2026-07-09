@@ -64,9 +64,11 @@ box_present() { docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/n
 # the default box, self-healing: if unset or pointing at a gone box, auto-adopt the
 # first existing box (and persist it) so there's always a default while ≥1 box exists.
 current_box() {
-  local c; c="$( [ -f "$CURRENT_FILE" ] && cat "$CURRENT_FILE" 2>/dev/null )"
+  local c=""
+  [ -f "$CURRENT_FILE" ] && c="$(cat "$CURRENT_FILE" 2>/dev/null || true)"
   if [ -n "$c" ] && box_present "$(slugify "$c")"; then printf '%s' "$c"; return; fi
-  local first; first="$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | head -1)"
+  local first
+  first="$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | sed -n '1p' || true)"
   [ -n "$first" ] && { set_current "$first"; printf '%s' "$first"; }
 }
 
@@ -111,6 +113,47 @@ dexec() {
   docker exec -i -u discourse:discourse -w /src -e HOME=/home/discourse "$cname" bash -lc "$*"
 }
 
+ensure_pnpm_ignored_builds() {
+  local cname="$1"
+  docker exec -u discourse:discourse -w /src "$cname" ruby -ryaml -e '
+    path = "pnpm-workspace.yaml"
+    exit 0 unless File.file?(path)
+
+    data = YAML.load_file(path) || {}
+    existing = data["ignoredBuiltDependencies"]
+    existing = existing.split(",").map(&:strip) if existing.is_a?(String)
+    ignored = Array(existing)
+    wanted = (ignored + %w[core-js rete]).uniq
+    exit 0 if wanted == ignored
+
+    data["ignoredBuiltDependencies"] = wanted
+    File.write(path, YAML.dump(data))
+  '
+}
+
+run_db_migrations() {
+  local cname="$1"
+  echo "==> databases (plugin-aware migrations)"
+  dexec "$cname" "LOAD_PLUGINS=1 bin/rake db:migrate && LOAD_PLUGINS=1 RAILS_ENV=test bin/rake db:migrate"
+}
+
+configure_app_url() {
+  local cname="$1" url host port
+  url="$(app_url_for "$cname")"
+  host="$(url_host "$url")"
+  port="$(url_port "$url")"
+  [ -n "$host" ] && [ -n "$port" ] || return 0
+  echo "==> canonical app URL: $url"
+  local ruby='
+    SiteSetting.force_hostname = ENV.fetch("DBOX_CANONICAL_HOST")
+    SiteSetting.port = ENV.fetch("DBOX_CANONICAL_PORT")
+    puts "canonical: #{Discourse.base_url}"
+  '
+  printf '%s' "$ruby" | docker exec -i -u discourse:discourse -w /src -e HOME=/home/discourse \
+    -e DBOX_CANONICAL_HOST="$host" -e DBOX_CANONICAL_PORT="$port" \
+    "$cname" bash -lc 'bundle exec rails runner -'
+}
+
 # run ruby in the box's Rails environment. Code is fed via stdin (`rails runner -`)
 # so quotes/newlines in the code are never mangled by shell quoting.
 run_rails() {
@@ -150,10 +193,155 @@ set_git_identity() {
   fi
 }
 
+codex_auth_source() {
+  local best="" f
+  for f in "$REPO/.codex/auth.json" "$HOME/.codex/auth.json"; do
+    [ -f "$f" ] || continue
+    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best="$f"; fi
+  done
+  printf '%s' "$best"
+}
+
+prepare_codex_auth_source() {
+  local src project
+  src="$(codex_auth_source)"
+  [ -n "$src" ] || return 0
+
+  project="$REPO/.codex/auth.json"
+  if [ "$src" != "$project" ]; then
+    mkdir -p "$(dirname "$project")"
+    if ! cmp -s "$src" "$project"; then
+      cp -p "$src" "$project"
+    fi
+    chmod 600 "$project" 2>/dev/null || true
+    src="$project"
+  else
+    chmod 600 "$src" 2>/dev/null || true
+  fi
+
+  printf '%s' "$src"
+}
+
+copy_codex_auth_to_seed() {
+  local src="$1" seed="$2" dest
+  [ -n "$src" ] && [ -n "$seed" ] || return 0
+  dest="$seed/.codex/auth.json"
+  mkdir -p "$(dirname "$dest")"
+  cp -p "$src" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
+copy_codex_auth_to_container() {
+  local src="$1" cname="$2"
+  [ -n "$src" ] && [ -n "$cname" ] || return 0
+  container_exists "$cname" || return 0
+  container_running "$cname" || return 0
+  docker exec -u root "$cname" mkdir -p /home/discourse/.codex
+  docker cp -L "$src" "$cname:/home/discourse/.codex/auth.json"
+  docker exec -u root "$cname" chown discourse:discourse /home/discourse/.codex/auth.json
+  docker exec -u root "$cname" chmod 600 /home/discourse/.codex/auth.json
+}
+
+sync_codex_auth() {
+  local cname="${1:-}" seed="${2:-}" src
+  src="$(prepare_codex_auth_source)"
+  if [ -z "$src" ]; then
+    echo "==> codex auth: no host auth found at $REPO/.codex/auth.json or ~/.codex/auth.json"
+    return 0
+  fi
+
+  copy_codex_auth_to_seed "$src" "$seed"
+  copy_codex_auth_to_container "$src" "$cname"
+  echo "==> codex auth synced from $src"
+}
+
+sync_codex_auth_all() {
+  local src seed n
+  src="$(prepare_codex_auth_source)"
+  if [ -z "$src" ]; then
+    echo "==> codex auth: no host auth found at $REPO/.codex/auth.json or ~/.codex/auth.json"
+    return 0
+  fi
+
+  for seed in "$DBOX_DIR"/state/*/seed; do
+    [ -d "$seed" ] || continue
+    copy_codex_auth_to_seed "$src" "$seed"
+  done
+
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    copy_codex_auth_to_container "$src" "$n"
+  done < <(docker ps --filter label=d-box --format '{{.Names}}' 2>/dev/null || true)
+
+  echo "==> codex auth synced from $src"
+}
+
+patch_playwright_mcp_configs() {
+  local cname="$1"
+  container_exists "$cname" || return 0
+  container_running "$cname" || return 0
+  docker exec -u discourse:discourse -e HOME=/home/discourse -e DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" "$cname" ruby -rjson -e '
+    args = [
+      "-y",
+      ENV.fetch("DBOX_PLAYWRIGHT_MCP"),
+      "--browser",
+      "chromium",
+      "--headless",
+      "--no-sandbox",
+    ]
+
+    def patch_value(value, args)
+      changed = false
+      case value
+      when Hash
+        value.each_value do |child|
+          if child.is_a?(Hash) &&
+             child["args"].is_a?(Array) &&
+             child["args"].any? { |arg| arg.to_s.start_with?("@playwright/mcp") }
+            child["args"] = args
+            changed = true
+          end
+          changed = true if patch_value(child, args)
+        end
+      when Array
+        value.each { |child| changed = true if patch_value(child, args) }
+      end
+      changed
+    end
+
+    roots = [
+      File.join(ENV.fetch("HOME"), ".claude/plugins"),
+      File.join(ENV.fetch("HOME"), ".codex/.tmp/marketplaces"),
+    ]
+    roots.each do |root|
+      Dir.glob(File.join(root, "**", "{*,.*}.json"), File::FNM_DOTMATCH).each do |path|
+        next unless File.file?(path)
+
+        begin
+          data = JSON.parse(File.read(path))
+        rescue JSON::ParserError
+          next
+        end
+        next unless patch_value(data, args)
+
+        File.write(path, JSON.pretty_generate(data) + "\n")
+      end
+    end
+  '
+}
+
 # --- Tailnet exposure via `tailscale serve` (per-box port) -------------------
 ts_bin() { command -v tailscale 2>/dev/null || { [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && echo /Applications/Tailscale.app/Contents/MacOS/Tailscale; }; }
 ts_up() { local t; t="$(ts_bin)"; [ -n "$t" ] && "$t" status >/dev/null 2>&1; }
 ts_dnsname() { "$(ts_bin)" status --json 2>/dev/null | jq -r '.Self.DNSName' 2>/dev/null | sed 's/\.$//'; }
+ts_served_ports() {
+  local t; t="$(ts_bin)"
+  [ -n "$t" ] || return 0
+  "$t" serve status 2>/dev/null |
+    grep -oE ':[0-9]+[[:space:]]+\(tailnet only\)' |
+    grep -oE '[0-9]+' |
+    sort -u
+}
 
 # RAILS_DEVELOPMENT_HOSTS value for a box's dev server. Rails' leading-dot rule
 # (.ts.net) only permits ONE subdomain label, so the nested MagicDNS name
@@ -164,6 +352,30 @@ dev_hosts() {
   [ -n "$d" ] && h="$h,$d"
   printf '%s' "$h"
 }
+
+local_url_for() {
+  local slug="$1"
+  printf 'http://%s.orb.local:%s' "$slug" "$APP_PORT"
+}
+
+tailnet_url_for() {
+  local slug="$1" port="${2:-}" dns=""
+  [ "$EXPOSE_TAILNET" = 1 ] || return 1
+  ts_up || return 1
+  dns="$(ts_dnsname)"
+  [ -n "$dns" ] || return 1
+  [ -n "$port" ] || port="$(ts_port_for "$slug")"
+  [ -n "$port" ] || return 1
+  printf 'http://%s:%s' "$dns" "$port"
+}
+
+app_url_for() {
+  local slug="$1" port="${2:-}"
+  tailnet_url_for "$slug" "$port" || local_url_for "$slug"
+}
+
+url_host() { printf '%s' "$1" | sed -E 's#^https?://([^:/]+).*#\1#'; }
+url_port() { printf '%s' "$1" | sed -nE 's#^https?://[^:/]+:([0-9]+).*#\1#p'; }
 
 # true if nothing on the host is already LISTENing on this loopback port (the box
 # publishes 3000 there, so a collision — e.g. your own dev server on 3000 — would
@@ -176,7 +388,7 @@ ts_port_for() {
   local slug="$1" pf="$DBOX_DIR/state/$slug/tailnet-port"
   if [ -f "$pf" ]; then cat "$pf"; return; fi
   local used p
-  used="$("$(ts_bin)" serve status 2>/dev/null | grep -oE 'ts\.net:[0-9]+' | grep -oE '[0-9]+$' | sort -u)"
+  used="$(ts_served_ports)"
   for p in $(seq "$TS_BASE_PORT" $((TS_BASE_PORT+99))); do
     printf '%s\n' "$used" | grep -qx "$p" && continue
     grep -rqsx "$p" "$DBOX_DIR"/state/*/tailnet-port 2>/dev/null && continue
@@ -260,7 +472,7 @@ apply_copy_manifest() {
 
 # tell the agents (claude + codex) the box's own URL, via files they read by default
 write_url_context() {
-  local cname="$1" url="http://$cname.orb.local:$APP_PORT"
+  local cname="$1" url; url="$(app_url_for "$cname")"
   local note="# d-box environment
 
 This is a disposable Discourse dev box. The running app is served at: ${url}
@@ -285,6 +497,9 @@ run_box_container() {
   local cname="$1" slug="$2" wt="$3" seed="$4" img="$5" nmvol="${6:-$(node_modules_volume_name "$slug")}" pubport="${7:-}"
   local nm_opt=(-v "$nmvol:/src/node_modules")
   local pub_opt=()
+  local app_url app_host
+  app_url="$(app_url_for "$slug" "$pubport")"
+  app_host="$(url_host "$app_url")"
   [ -n "$pubport" ] && pub_opt=(-p "127.0.0.1:$pubport:3000")
   docker run -d --name "$cname" --hostname "$cname" \
     --label d-box=1 --label "d-box.slug=$slug" \
@@ -294,8 +509,8 @@ run_box_container() {
     -e CHROME_BIN=/usr/local/bin/chromium \
     -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
     -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 \
-    -e "DBOX_APP_URL=http://$cname.orb.local:$APP_PORT" \
-    -e "DISCOURSE_HOSTNAME=$cname.orb.local" \
+    -e "DBOX_APP_URL=$app_url" \
+    -e "DISCOURSE_HOSTNAME=$app_host" \
     -v "$wt:/src:delegated" \
     -v "$GIT_COMMON:$GIT_COMMON" \
     -v "$seed:/seed:ro" \
@@ -348,7 +563,11 @@ cmd_new() {
 
   echo "==> staging curated config seed"
   mkdir -p "$DBOX_DIR/state/$slug"
-  DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" ruby "$DBOX_DIR/stage-seed.rb" "$seed"
+  local codex_auth; codex_auth="$(prepare_codex_auth_source)"
+  DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" \
+    DBOX_REPO="$REPO" \
+    DBOX_CODEX_AUTH_FILE="$codex_auth" \
+    ruby "$DBOX_DIR/stage-seed.rb" "$seed"
 
   if container_exists "$cname"; then
     is_dbox "$cname" || die "a non-d-box container named '$cname' already exists — pick another branch name"
@@ -365,6 +584,8 @@ cmd_new() {
 
   wait_pg "$cname"
 
+  sync_codex_auth "$cname" "$seed"
+  patch_playwright_mcp_configs "$cname"
   set_git_identity "$cname"
   write_url_context "$cname"
   apply_copy_manifest "$slug"
@@ -372,16 +593,16 @@ cmd_new() {
 
   echo "==> syncing deps (fast — baseline is baked into the image)"
   dexec "$cname" "bundle check || bundle install"
+  ensure_pnpm_ignored_builds "$cname"
   # pnpm can transiently ENOMEM while copying many packages — retry a few times
   local i
   for i in 1 2 3; do
-    dexec "$cname" "pnpm install" && break
+    dexec "$cname" "pnpm install --config.strict-dep-builds=false" && break
     [ "$i" = 3 ] && die "pnpm install failed after 3 attempts"
     echo "   pnpm install hiccup (attempt $i) — retrying in 5s"; sleep 5
   done
-  echo "==> databases (migrate only if something is pending)"
-  maybe_migrate "$cname" development discourse_development
-  maybe_migrate "$cname" test discourse_test
+  run_db_migrations "$cname"
+  configure_app_url "$cname"
 
   create_admin "$cname"
 
@@ -398,35 +619,15 @@ cmd_new() {
     start_dev_bg "$cname"
     echo
     echo "box ready: $cname"
-    echo "app:   http://$cname.orb.local:$APP_PORT"
-    [ -n "$ADMIN_PASS" ] && echo "login: http://$cname.orb.local:$APP_PORT/session/${ADMIN_USER:-admin}/become"
+    local app_url; app_url="$(app_url_for "$cname")"
+    echo "app:   $app_url"
+    [ -n "$ADMIN_PASS" ] && echo "login: $app_url/session/${ADMIN_USER:-admin}/become"
   fi
 
   expose_box "$slug"
 
   echo
   echo "  d-box claude $branch   |   d-box codex $branch   |   d-box shell $branch"
-}
-
-# run rake db:migrate only if migration files exist that aren't in schema_migrations.
-# the check is a cheap psql query (no Rails boot); the boot only happens when needed.
-maybe_migrate() {
-  local cname="$1" env="$2" dbname="$3" pending
-  pending=$(docker exec -u discourse:discourse -w /src -e DBN="$dbname" "$cname" bash -lc '
-    files=$( ls db/migrate db/post_migrate 2>/dev/null | grep -oE "^[0-9]{14}" | sort -u )
-    applied=$( psql -tAq -d "$DBN" -c "select version from schema_migrations" 2>/dev/null | sort -u )
-    comm -23 <(printf "%s\n" "$files") <(printf "%s\n" "$applied")
-  ' 2>/dev/null)
-  if [ -n "$pending" ]; then
-    echo "   $env: $(printf '%s\n' "$pending" | grep -c .) pending — running db:migrate"
-    if [ "$env" = test ]; then
-      dexec "$cname" "RAILS_ENV=test bundle exec rake db:migrate"
-    else
-      dexec "$cname" "bundle exec rake db:migrate"
-    fi
-  else
-    echo "   $env: up to date — skipping"
-  fi
 }
 
 # create/refresh an active admin user (no-op unless DBOX_ADMIN_PASSWORD is set).
@@ -469,6 +670,7 @@ cmd_claude() {
   [ -n "$branch" ] || die "no box given and no default set (d-box use <box>)"
   local cname="$(slugify "$branch")"
   ensure_running "$cname"
+  patch_playwright_mcp_configs "$cname"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
     "$cname" claude --dangerously-skip-permissions "$@"
 }
@@ -479,6 +681,8 @@ cmd_codex() {
   [ -n "$branch" ] || die "no box given and no default set (d-box use <box>)"
   local cname="$(slugify "$branch")"
   ensure_running "$cname"
+  sync_codex_auth "$cname" "$DBOX_DIR/state/$cname/seed"
+  patch_playwright_mcp_configs "$cname"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
     "$cname" codex --dangerously-bypass-approvals-and-sandbox "$@"
 }
@@ -517,11 +721,15 @@ cmd_admin() {
 cmd_serve() {
   local cname; cname="$(slugify "$(need_box "${1:-}")")"
   ensure_running "$cname"
-  echo "dev server starting — once it's up, open: http://$cname.orb.local:$APP_PORT"
+  local app_url app_host
+  app_url="$(app_url_for "$cname")"
+  app_host="$(url_host "$app_url")"
+  configure_app_url "$cname"
+  echo "dev server starting — once it's up, open: $app_url"
   echo "(Ctrl-C stops the server; the box keeps running. Use 'd-box up' to run it in the background.)"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
     -e UNICORN_BIND_ALL=true -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
-    -e "DISCOURSE_HOSTNAME=$cname.orb.local" \
+    -e "DISCOURSE_HOSTNAME=$app_host" \
     -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 "$cname" bin/dev
 }
 
@@ -548,10 +756,13 @@ stop_dev() {
 start_dev_bg() {
   local cname="$1"
   dev_responds "$cname" && return 0
+  local app_url app_host
+  app_url="$(app_url_for "$cname")"
+  app_host="$(url_host "$app_url")"
   docker exec "$cname" bash -lc 'pkill -9 -f "bin/dev"; pkill -9 -f pitchfork; pkill -9 -f rolldown; true' 2>/dev/null || true
   docker exec -d -u discourse:discourse -w /src -e HOME=/home/discourse \
     -e UNICORN_BIND_ALL=true -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
-    -e "DISCOURSE_HOSTNAME=$cname.orb.local" \
+    -e "DISCOURSE_HOSTNAME=$app_host" \
     -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 "$cname" bash -lc 'bin/dev > /tmp/dev.log 2>&1'
 }
 
@@ -560,6 +771,7 @@ cmd_up() {
   local branch; branch="$(need_box "${1:-}")"
   local cname="$(slugify "$branch")"
   ensure_running "$cname"
+  configure_app_url "$cname"
   if dev_responds "$cname"; then
     echo "dev server already running"
   else
@@ -574,8 +786,10 @@ cmd_up() {
     echo
     dev_responds "$cname" || echo "  (warning: not responding yet — check: d-box logs $branch)"
   fi
-  echo "app:   http://$cname.orb.local:$APP_PORT"
-  [ -n "$ADMIN_PASS" ] && echo "login: http://$cname.orb.local:$APP_PORT/session/${ADMIN_USER:-admin}/become"
+  local app_url; app_url="$(app_url_for "$cname")"
+  echo "app:   $app_url"
+  [ -n "$ADMIN_PASS" ] && echo "login: $app_url/session/${ADMIN_USER:-admin}/become"
+  expose_box "$cname"
   echo "logs:  d-box logs $branch   |   stop: d-box down $branch"
 }
 
@@ -652,15 +866,18 @@ cmd_repair() {
   fi
   docker rm -f "$cname" >/dev/null 2>&1 || true
   echo "   recreating with the stable ssh-agent mount"
+  sync_codex_auth "" "$seed"
   local pubport=""; [ "$EXPOSE_TAILNET" = 1 ] && pubport="$(ts_port_for "$slug")"
   run_box_container "$cname" "$slug" "$wt" "$seed" "$tmp" "$nmvol" "$pubport"
   wait_pg "$cname"
+  sync_codex_auth "$cname" "$seed"
+  patch_playwright_mcp_configs "$cname"
   if [ -n "$old_nmvol" ] && [ "$old_nmvol" != "$nmvol" ]; then
     docker volume rm "$old_nmvol" >/dev/null 2>&1 || true
   fi
-  set_git_identity "$cname"; write_url_context "$cname"; expose_box "$slug"
+  set_git_identity "$cname"; configure_app_url "$cname"; write_url_context "$cname"; expose_box "$slug"
   echo "==> starting dev server in the background"; start_dev_bg "$cname"
-  echo; echo "repaired: $cname  ->  http://$cname.orb.local:$APP_PORT"
+  echo; echo "repaired: $cname  ->  $(app_url_for "$cname")"
 }
 
 cmd_logs() {
@@ -671,11 +888,10 @@ cmd_logs() {
 
 cmd_url() {
   local cname; cname="$(slugify "$(need_box "${1:-}")")"
-  echo "local:   http://$cname.orb.local:$APP_PORT"
-  local pf="$DBOX_DIR/state/$cname/tailnet-port"
-  if [ -f "$pf" ] && ts_up; then
-    echo "tailnet: http://$(ts_dnsname):$(cat "$pf")"
-  fi
+  container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
+  echo "app:     $(app_url_for "$cname")"
+  echo "local:   $(local_url_for "$cname")"
+  expose_box "$cname"
 }
 
 # snapshot a box's current state (DB + system changes) into a reusable image.
@@ -741,19 +957,25 @@ cmd_use() {
 
 cmd_list() {
   echo "== boxes ==  (* = default; set with: d-box use <box>)"
-  local cur names dns; cur="$(slugify "$(current_box)")"
+  local cur names dns served_ports; cur="$(slugify "$(current_box)")"
   names=$(docker ps -a --filter "label=d-box" --format '{{.Names}}' 2>/dev/null)
-  ts_up && dns="$(ts_dnsname)" || dns=""
+  if ts_up; then
+    dns="$(ts_dnsname)"
+    served_ports="$(ts_served_ports)"
+  else
+    dns=""
+    served_ports=""
+  fi
   if [ -n "$names" ]; then
     {
-      printf ' \tNAME\tSTATUS\tURL\tTAILNET\n'
+      printf ' \tNAME\tSTATUS\tAPP\tLOCAL\n'
       while IFS= read -r n; do
         [ -n "$n" ] || continue
-        local m st tn pf; m=" "; [ "$n" = "$cur" ] && m="*"
+        local m st app local_url; m=" "; [ "$n" = "$cur" ] && m="*"
         st="$(docker ps -a --filter "name=^${n}$" --format '{{.Status}}' 2>/dev/null | head -1)"
-        pf="$DBOX_DIR/state/$n/tailnet-port"; tn="-"
-        [ -f "$pf" ] && [ -n "$dns" ] && tn="http://$dns:$(cat "$pf")"
-        printf '%s\t%s\t%s\thttp://%s.orb.local:%s\t%s\n' "$m" "$n" "$st" "$n" "$APP_PORT" "$tn"
+        app="$(app_url_for "$n")"
+        local_url="$(local_url_for "$n")"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$n" "$st" "$app" "$local_url"
       done <<< "$names"
     } | column -t -s $'\t'
   else
@@ -820,6 +1042,7 @@ cmd_rm() {
 
 cmd_build() {
   local base_tag="${DBOX_IMAGE%%:*}:base"
+  sync_codex_auth_all
   echo "==> building base image $base_tag (from $BASE_IMAGE)"
   docker build --build-arg "BASE=$BASE_IMAGE" --build-arg "PLAYWRIGHT_MCP=$PLAYWRIGHT_MCP" \
     --build-arg "DISCOURSE_MCP=$DISCOURSE_MCP" \
@@ -848,19 +1071,12 @@ cmd_build() {
   '
   docker exec "$tmp" chown discourse:discourse /src/config/git-utils-overrides.json
 
-  docker exec -u discourse:discourse -w /src "$tmp" ruby -ryaml -e '
-    path = "pnpm-workspace.yaml"
-    data = YAML.load_file(path)
-    existing = data["ignoredBuiltDependencies"]
-    existing = existing.split(",").map(&:strip) if existing.is_a?(String)
-    data["ignoredBuiltDependencies"] = (Array(existing) + %w[core-js lefthook rete]).uniq
-    File.write(path, YAML.dump(data))
-  '
+  ensure_pnpm_ignored_builds "$tmp"
 
   local de=(docker exec -i -u discourse:discourse -w /src
             -e HOME=/home/discourse -e npm_config_store_dir=/src/node_modules/.pnpm-store "$tmp" bash -lc)
   echo "==> bundle install (baked)"; "${de[@]}" "gem uninstall psych -v 5.3.1 -i /home/discourse/.bundle/gems/ruby/3.4.0 -aIx >/dev/null 2>&1 || true; bundle install"
-  echo "==> pnpm install (baked)";   "${de[@]}" "pnpm install"
+  echo "==> pnpm install (baked)";   "${de[@]}" "pnpm install --config.strict-dep-builds=false"
   # bake the chromium the REPO's own playwright wants (for discourse system specs).
   # --no-shell: the specs launch with channel:chromium (driver.rb), i.e. the full
   # Chrome for Testing in new-headless mode — they never use the headless shell, so
@@ -873,10 +1089,10 @@ cmd_build() {
   # the headless shell — so install ONLY that, skipping the ~187MiB full browser.
   echo "==> playwright browser for the pinned MCP (baked, as discourse)"
   "${de[@]}" "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright npx -y $PLAYWRIGHT_MCP --version >/dev/null 2>&1; root=\$(find ~/.npm/_npx -mindepth 1 -maxdepth 1 -type d | head -1); echo \"   mcp npx root: \$root\"; [ -n \"\$root\" ] && ROOT=\"\$root\" PLAYWRIGHT_BROWSERS_PATH=/ms-playwright node -e 'const { registry } = require(process.env.ROOT + \"/node_modules/playwright-core/lib/coreBundle.js\").registry; const executables = registry.resolveBrowsers([\"chromium-headless-shell\"], { shell: \"only\" }); console.log(\"   installing \" + executables.map(e => e.name).join(\", \")); registry.install(executables).catch(error => { console.error(error); process.exit(1); });'" || echo "   (MCP playwright install skipped)"
-  echo "==> db migrate (baked: development)"
-  "${de[@]}" "SKIP_TEST_DATABASE=1 SKIP_MULTISITE=1 bundle exec rake db:create db:migrate"
-  echo "==> db migrate (baked: test)"
-  "${de[@]}" "RAILS_ENV=test LOAD_PLUGINS=1 bundle exec rake db:create db:migrate"
+  echo "==> db create (baked)"
+  "${de[@]}" "LOAD_PLUGINS=1 bin/rake db:create && LOAD_PLUGINS=1 RAILS_ENV=test bin/rake db:create"
+  echo "==> db migrate (baked: development + test, plugin-aware)"
+  "${de[@]}" "LOAD_PLUGINS=1 bin/rake db:migrate && LOAD_PLUGINS=1 RAILS_ENV=test bin/rake db:migrate"
 
   # optional: install the patch-triage MCP gem so its server works in the box
   if [ -d "$PATCH_TRIAGE_MCP" ]; then

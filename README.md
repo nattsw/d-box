@@ -38,6 +38,10 @@ attach instantly. Run several boxes at once for parallel tasks — they don't co
   rewriting `$HOME` → `/home/discourse`. The launcher mounts only that dir read-only at
   `/seed`. Your history, sessions, and other projects' state are never exposed.
   `entrypoint.rb` applies the seed into the box's home.
+- **Codex auth refresh**: `new`, `build`, `repair`, and `codex` copy the newest host
+  Codex token from `$DBOX_REPO/.codex/auth.json` or `~/.codex/auth.json`
+  into box seeds and running boxes. The host token is mirrored into the repo-local
+  `.codex/auth.json` path, which is ignored by git. Tokens are not baked into images.
 - **Git**: the worktree's `.git` points at the main repo's `.git` by absolute host path,
   so the launcher bind-mounts the shared `.git` at its identical path. Commits land in
   the shared object store (visible from the host). Run `git worktree` admin on the host.

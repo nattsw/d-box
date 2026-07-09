@@ -15,6 +15,7 @@ SEED = ARGV[0] or abort "usage: stage-seed.rb <seed_out_dir>"
 HOST_HOME = ENV["HOME"]
 BOX_HOME = "/home/discourse"
 AGENT_CONFIG_SKILLS = File.join(HOST_HOME, "workspace/agent-config/skills")
+HOST_REPO = ENV["DBOX_REPO"] || File.join(HOST_HOME, "work/discourse/discourse")
 
 # the box runs the agent with cwd /src, so claude keys project memory under "-src"
 PROJECT_KEY = "-src"
@@ -29,12 +30,19 @@ def rewrite(str)
   if PLAYWRIGHT_MCP && !PLAYWRIGHT_MCP.empty?
     # Pin the @playwright/mcp version AND force `--browser chromium`: the MCP
     # defaults to the "chrome" channel (branded Google Chrome), which has no
-    # arm64 Linux build, so it ignores the bundled chromium we baked. We inject
-    # the two args right after the package token (works for both JSON-array and
+    # arm64 Linux build, so it ignores the bundled chromium we baked. Headless
+    # and no-sandbox are also required for plugin MCP definitions that otherwise
+    # try to launch a headed/sandboxed browser inside the container. We inject
+    # the args right after the package token (works for both JSON-array and
     # TOML-array forms, which both use "x", "y"). Skip if --browser already set.
-    add_browser = !str.include?('"--browser"')
+    injected_prefix = []
+    injected_prefix << '"-y"' unless str.include?('"-y"')
+    injected_args = []
+    injected_args.concat(['"--browser"', '"chromium"']) unless str.include?('"--browser"')
+    injected_args << '"--headless"' unless str.include?('"--headless"')
+    injected_args << '"--no-sandbox"' unless str.include?('"--no-sandbox"')
     str = str.gsub(%r{"@playwright/mcp(@[^"]*)?"}) do
-      add_browser ? %("#{PLAYWRIGHT_MCP}", "--browser", "chromium") : %("#{PLAYWRIGHT_MCP}")
+      (injected_prefix + [%("#{PLAYWRIGHT_MCP}")] + injected_args).join(", ")
     end
     # also pin any non-quoted occurrences (e.g. in prose/help), just version
     str = str.gsub(%r{@playwright/mcp(@[^"'\s]+)?}, PLAYWRIGHT_MCP)
@@ -71,6 +79,10 @@ def copy_skill_dirs(src_dir, dst_dir, skip: [])
   copied
 end
 
+def newest_existing(paths)
+  paths.compact.select { |path| File.exist?(path) }.max_by { |path| File.mtime(path) }
+end
+
 def write(path, content)
   FileUtils.mkdir_p(File.dirname(path))
   File.write(path, content)
@@ -84,7 +96,7 @@ end
 
 def root_toml_keys(content)
   root, = split_leading_root_toml(content)
-  root.lines.filter_map { |line| line[/^\s*([A-Za-z0-9_-]+)\s*=/, 1] }
+  root.lines.map { |line| line[/^\s*([A-Za-z0-9_-]+)\s*=/, 1] }.compact
 end
 
 def prepend_root_toml(content, root)
@@ -177,9 +189,20 @@ if Dir.exist?(mcps_dir)
 end
 
 # ---- codex: auth, config (rewritten), rules, skills ----------------------
-copy(File.join(HOST_HOME, ".codex/auth.json"), File.join(codex_seed, "auth.json"))
+codex_auth = newest_existing([
+  ENV["DBOX_CODEX_AUTH_FILE"],
+  File.join(HOST_REPO, ".codex/auth.json"),
+  File.join(HOST_HOME, ".codex/auth.json"),
+])
+if codex_auth
+  copy(codex_auth, File.join(codex_seed, "auth.json"))
+  File.chmod(0o600, File.join(codex_seed, "auth.json"))
+else
+  warn "stage-seed: no codex auth found (repo .codex/auth.json or ~/.codex/auth.json) — box will require login"
+end
 copy(File.join(HOST_HOME, ".codex/rules"), File.join(codex_seed, "rules"))
 copy(File.join(HOST_HOME, ".codex/skills/.system"), File.join(codex_seed, "skills/.system"))
+copy(File.join(HOST_HOME, ".codex/.tmp/marketplaces"), File.join(codex_seed, ".tmp/marketplaces"))
 codex_skills = File.join(HOST_HOME, ".agents/skills")
 codex_machine_skills = []
 codex_machine_skills.concat(copy_skill_dirs(codex_skills, File.join(agents_seed, "skills")))
@@ -201,11 +224,21 @@ if File.exist?(codex_config)
   write(File.join(codex_seed, "config.toml"), content)
 end
 
-# ---- plugins: rewrite host paths in copied config so plugins resolve ------
-# (plugin JSON points at marketplace/repo install dirs by absolute path)
-Dir.glob(File.join(claude_seed, "plugins", "**", "*.json")).each do |f|
-  content = File.read(f)
-  File.write(f, rewrite(content)) if content.include?(HOST_HOME)
+# ---- plugins: rewrite host paths + pinned MCP packages in copied config ----
+# Some plugin MCP definitions live in hidden files like `.mcp.json`, so include
+# dotfiles here. This keeps plugin-provided Playwright MCPs from drifting to
+# @latest while the baked browser remains pinned.
+[
+  File.join(claude_seed, "plugins"),
+  File.join(codex_seed, ".tmp/marketplaces"),
+].each do |root|
+  Dir.glob(File.join(root, "**", "{*,.*}.json"), File::FNM_DOTMATCH).each do |f|
+    next unless File.file?(f)
+
+    content = File.read(f)
+    rewritten = rewrite(content)
+    File.write(f, rewritten) if rewritten != content
+  end
 end
 
 # ---- shared memory under the /src project key ----------------------------
