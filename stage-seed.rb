@@ -28,17 +28,17 @@ PLAYWRIGHT_MCP = ENV["DBOX_PLAYWRIGHT_MCP"] # e.g. "@playwright/mcp@0.0.75"
 def rewrite(str)
   str = str.gsub(HOST_HOME, BOX_HOME)
   if PLAYWRIGHT_MCP && !PLAYWRIGHT_MCP.empty?
-    # Pin the @playwright/mcp version AND force `--browser chromium`: the MCP
-    # defaults to the "chrome" channel (branded Google Chrome), which has no
-    # arm64 Linux build, so it ignores the bundled chromium we baked. Headless
-    # and no-sandbox are also required for plugin MCP definitions that otherwise
-    # try to launch a headed/sandboxed browser inside the container. We inject
+    # Pin the @playwright/mcp version and force it through d-box's Chromium
+    # wrapper. MCP's --browser option is a Chrome channel selector; "chromium"
+    # is not a supported value there, so use --executable-path instead.
+    # Headless and no-sandbox are also required inside the container. We inject
     # the args right after the package token (works for both JSON-array and
-    # TOML-array forms, which both use "x", "y"). Skip if --browser already set.
+    # TOML-array forms, which both use "x", "y").
+    str = str.gsub(/,\s*"--browser"\s*,\s*"[^"]*"/, "")
     injected_prefix = []
     injected_prefix << '"-y"' unless str.include?('"-y"')
     injected_args = []
-    injected_args.concat(['"--browser"', '"chromium"']) unless str.include?('"--browser"')
+    injected_args.concat(['"--executable-path"', '"/usr/local/bin/chromium"']) unless str.include?('"--executable-path"')
     injected_args << '"--headless"' unless str.include?('"--headless"')
     injected_args << '"--no-sandbox"' unless str.include?('"--no-sandbox"')
     str = str.gsub(%r{"@playwright/mcp(@[^"]*)?"}) do

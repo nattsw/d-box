@@ -284,8 +284,8 @@ patch_playwright_mcp_configs() {
     args = [
       "-y",
       ENV.fetch("DBOX_PLAYWRIGHT_MCP"),
-      "--browser",
-      "chromium",
+      "--executable-path",
+      "/usr/local/bin/chromium",
       "--headless",
       "--no-sandbox",
     ]
@@ -326,6 +326,24 @@ patch_playwright_mcp_configs() {
 
         File.write(path, JSON.pretty_generate(data) + "\n")
       end
+    end
+
+    claude_json = File.join(ENV.fetch("HOME"), ".claude.json")
+    if File.file?(claude_json)
+      data = JSON.parse(File.read(claude_json))
+      if patch_value(data, args)
+        File.write(claude_json, JSON.pretty_generate(data) + "\n")
+      end
+    end
+
+    codex_config = File.join(ENV.fetch("HOME"), ".codex/config.toml")
+    if File.file?(codex_config)
+      content = File.read(codex_config)
+      content = content.gsub(
+        /args = \[[^\]]*"@playwright\/mcp[^"]*"[^\]]*\]/,
+        "args = [#{args.map(&:inspect).join(", ")}]"
+      )
+      File.write(codex_config, content)
     end
   '
 }
