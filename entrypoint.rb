@@ -5,9 +5,64 @@
 # discourse user's home, then hands off to the base image's service supervisor.
 
 require "fileutils"
+require "socket"
 
 BOX_HOME = "/home/discourse"
 CHROMIUM_WRAPPER = "/usr/local/bin/chromium"
+PLAYWRIGHT_MCP_WRAPPER = "/usr/local/bin/d-box-playwright-mcp"
+DEV_SERVICE_DIR = "/etc/service/d-box-dev"
+AUTO_SERVE_MARKER = "/var/lib/d-box/auto-serve"
+BOX_OWNER_FILE = "/var/lib/d-box/owner"
+
+def container_generation
+  # Legacy boxes have no generation env, so their stable hostname is the
+  # migration key. Newly created/repaired boxes receive a unique immutable key.
+  ENV.fetch("DBOX_CONTAINER_GENERATION", Socket.gethostname)
+end
+
+def install_dev_service
+  FileUtils.mkdir_p(DEV_SERVICE_DIR)
+  FileUtils.mkdir_p(File.dirname(AUTO_SERVE_MARKER))
+  File.write(
+    "#{DEV_SERVICE_DIR}/run",
+    <<~BASH,
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      cd /src
+      export HOME=/home/discourse
+      export UNICORN_BIND_ALL=true
+      export DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1
+
+      # runsv starts services concurrently. Do not let Rails race the database
+      # services during a container/host reboot.
+      until pg_isready -q && redis-cli ping >/dev/null 2>&1; do
+        sleep 1
+      done
+
+      exec chpst -u discourse:discourse bash -lc 'exec bin/dev' >> /tmp/dev.log 2>&1
+    BASH
+  )
+  File.chmod(0o755, "#{DEV_SERVICE_DIR}/run")
+
+  # runit reads this file when runsvdir starts. `d-box up` removes it and records
+  # the desired state in AUTO_SERVE_MARKER; `d-box down` does the inverse.
+  down_file = "#{DEV_SERVICE_DIR}/down"
+  if File.exist?(AUTO_SERVE_MARKER)
+    FileUtils.rm_f(down_file)
+  else
+    FileUtils.touch(down_file)
+  end
+end
+
+# Existing containers bind-mount this file, so the launcher can install the new
+# runit service in-place without rebuilding or recreating the box.
+if ARGV == ["--install-dev-service"]
+  FileUtils.mkdir_p(File.dirname(BOX_OWNER_FILE))
+  File.write(BOX_OWNER_FILE, "#{container_generation}\n")
+  install_dev_service
+  exit
+end
 
 File.write(
   CHROMIUM_WRAPPER,
@@ -30,6 +85,25 @@ File.write(
   BASH
 )
 File.chmod(0o755, CHROMIUM_WRAPPER)
+
+File.write(
+  PLAYWRIGHT_MCP_WRAPPER,
+  <<~BASH,
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}"
+    export CHROME_BIN="${CHROME_BIN:-/usr/local/bin/chromium}"
+    pkg="${DBOX_PLAYWRIGHT_MCP:-@playwright/mcp@0.0.75}"
+
+    if command -v playwright-mcp >/dev/null 2>&1; then
+      exec playwright-mcp --executable-path "$CHROME_BIN" --isolated --headless --no-sandbox "$@"
+    fi
+
+    exec npx -y "$pkg" --executable-path "$CHROME_BIN" --isolated --headless --no-sandbox "$@"
+  BASH
+)
+File.chmod(0o755, PLAYWRIGHT_MCP_WRAPPER)
 
 if Dir.exist?("/seed")
   # copy the curated config tree (.claude, .claude.json, .mcps, .codex, .agents) into HOME
@@ -128,6 +202,20 @@ File.chmod(0o600, cfg) if File.exist?(cfg)
 # ownership onto HOME and would otherwise revert it to root. Non-recursive, so it
 # does NOT touch the baked ~/.bundle gems inside.
 system("chown", "discourse:discourse", BOX_HOME)
+
+# A snapshot may contain the source box's auto-serve marker. A different
+# container generation means this is a newly-created/repaired box, not a reboot,
+# so start disabled until the launcher finishes initialization and explicitly
+# enables it.
+current_owner = container_generation
+previous_owner = File.exist?(BOX_OWNER_FILE) ? File.read(BOX_OWNER_FILE).strip : ""
+if previous_owner != current_owner
+  FileUtils.rm_f(AUTO_SERVE_MARKER)
+  FileUtils.mkdir_p(File.dirname(BOX_OWNER_FILE))
+  File.write(BOX_OWNER_FILE, "#{current_owner}\n")
+end
+
+install_dev_service
 
 # keep the container alive + boot postgres/redis/etc (replaces PID 1)
 exec "/sbin/boot"

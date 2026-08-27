@@ -24,6 +24,7 @@ HOST_MEMORY = File.join(HOST_HOME, ".claude/projects/-Users-natalie-work-discour
 # pin the Playwright MCP to the version whose chromium we baked into the image,
 # so @latest can't drift ahead of the baked browser. Passed in via env.
 PLAYWRIGHT_MCP = ENV["DBOX_PLAYWRIGHT_MCP"] # e.g. "@playwright/mcp@0.0.75"
+PLAYWRIGHT_MCP_COMMAND = "/usr/local/bin/d-box-playwright-mcp"
 
 def rewrite(str)
   str = str.gsub(HOST_HOME, BOX_HOME)
@@ -119,6 +120,101 @@ def prepend_root_toml(content, root)
   first_table = lines.index { |line| line.match?(/^\s*\[/) } || lines.length
   lines.insert(first_table, "\n# --- discourse project root config (folded in from repo .codex/config.toml) ---\n", *inserted, "\n")
   lines.join
+end
+
+def toml_table_header(line)
+  line[/\A\s*(\[[^\n#]+\])(?:\s*#.*)?\s*\z/, 1]
+end
+
+def toml_assignment_keys(lines)
+  lines.filter_map do |line|
+    line[/\A\s*((?:[A-Za-z0-9_-]+|"(?:\\.|[^"])*"|'[^']*'))\s*=/, 1]
+  end
+end
+
+def merge_toml_tables(content, extra, label:)
+  extra_lines = extra.lines
+  table_starts = extra_lines.each_index.select { |i| toml_table_header(extra_lines[i]) }
+  appended = []
+
+  table_starts.each_with_index do |start, index|
+    finish = table_starts[index + 1] || extra_lines.length
+    section = extra_lines[start...finish]
+    header = toml_table_header(section.first)
+    content_lines = content.lines
+    existing_start = content_lines.index { |line| toml_table_header(line) == header }
+
+    # Array-of-table declarations are intentionally repeatable in TOML, so they
+    # must remain separate even when both config files use the same header.
+    unless existing_start && !header.start_with?("[[")
+      appended.concat(section)
+      next
+    end
+
+    existing_finish = ((existing_start + 1)...content_lines.length).find do |i|
+      toml_table_header(content_lines[i])
+    end || content_lines.length
+    existing_keys = toml_assignment_keys(content_lines[(existing_start + 1)...existing_finish])
+    added_keys = toml_assignment_keys(section.drop(1))
+    duplicate_keys = existing_keys & added_keys
+    unless duplicate_keys.empty?
+      abort "stage-seed: #{label} repeats #{header} keys: #{duplicate_keys.join(', ')}"
+    end
+
+    content_lines.insert(
+      existing_finish,
+      "\n# --- #{label} (merged into #{header}) ---\n",
+      *section.drop(1),
+    )
+    content = content_lines.join
+  end
+
+  if appended.any?
+    content += "\n# --- #{label} ---\n"
+    content += appended.join
+  end
+
+  content
+end
+
+def patch_playwright_mcp_value(value)
+  changed = false
+
+  case value
+  when Hash
+    if value["args"].is_a?(Array) &&
+       value["args"].any? { |arg| arg.to_s.start_with?("@playwright/mcp") }
+      value["command"] = PLAYWRIGHT_MCP_COMMAND
+      value["args"] = []
+      changed = true
+    end
+
+    value.each_value do |child|
+      changed = true if patch_playwright_mcp_value(child)
+    end
+  when Array
+    value.each do |child|
+      changed = true if patch_playwright_mcp_value(child)
+    end
+  end
+
+  changed
+end
+
+def patch_playwright_json_file(path)
+  data = JSON.parse(File.read(path))
+  return false unless patch_playwright_mcp_value(data)
+
+  File.write(path, JSON.pretty_generate(data) + "\n")
+  true
+rescue JSON::ParserError
+  false
+end
+
+def patch_playwright_toml(content)
+  content.gsub(/(\[mcp_servers\.playwright\]\n)(?:command = .*\n)?(?:args = .*\n)?/) do
+    "#{$1}command = #{PLAYWRIGHT_MCP_COMMAND.inspect}\nargs = []\n"
+  end
 end
 
 FileUtils.rm_rf(SEED)
@@ -218,10 +314,13 @@ if File.exist?(codex_config)
   if File.exist?(repo_codex)
     repo_root, repo_tables = split_leading_root_toml(rewrite(File.read(repo_codex)))
     content = prepend_root_toml(content, repo_root)
-    content += "\n# --- discourse project MCPs (folded in from repo .codex/config.toml) ---\n"
-    content += repo_tables
+    content = merge_toml_tables(
+      content,
+      repo_tables,
+      label: "discourse project MCPs folded in from repo .codex/config.toml",
+    )
   end
-  write(File.join(codex_seed, "config.toml"), content)
+  write(File.join(codex_seed, "config.toml"), patch_playwright_toml(content))
 end
 
 # ---- plugins: rewrite host paths + pinned MCP packages in copied config ----
@@ -238,6 +337,7 @@ end
     content = File.read(f)
     rewritten = rewrite(content)
     File.write(f, rewritten) if rewritten != content
+    patch_playwright_json_file(f)
   end
 end
 

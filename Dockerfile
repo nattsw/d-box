@@ -35,8 +35,9 @@ RUN npx -y playwright@latest install --with-deps chromium >/dev/null 2>&1 || tru
 # (npm global prefix is /usr → on PATH for all users.)
 ARG CLI_CACHEBUST=0
 ARG DISCOURSE_MCP=@discourse/mcp@0.1.10
+ARG PLAYWRIGHT_MCP=@playwright/mcp@0.0.75
 RUN echo "cli build token: ${CLI_CACHEBUST}" \
- && npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest "${DISCOURSE_MCP}"
+ && npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest "${DISCOURSE_MCP}" "${PLAYWRIGHT_MCP}"
 
 COPY entrypoint.rb /usr/local/bin/d-box-entrypoint
 RUN chmod +x /usr/local/bin/d-box-entrypoint

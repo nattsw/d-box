@@ -13,12 +13,13 @@ _d-box() {
     'rmsnap:delete a snapshot'
     'claude:launch YOLO claude in the box'
     'codex:launch full-bypass codex in the box'
+    'imgpaste:save the host clipboard image in the box tmp directory'
     'shell:bash prompt in the box'
     'rails:rails console (or run ruby in the rails env)'
-    'up:start the dev server in the background'
-    'down:stop the dev server'
+    'up:start the dev server and enable reboot auto-serving'
+    'down:stop the dev server and disable reboot auto-serving'
     'restart:stop the dev server fully, then start it again'
-    'start:start the container (does not launch the dev server)'
+    'start:start the container and resume its previously enabled dev server'
     'stop:stop the container (keeps DB + volumes)'
     'serve:run the dev server in the foreground'
     'logs:tail the dev server log'
@@ -38,7 +39,7 @@ _d-box() {
 
   local cmd=${words[2]}
   case $cmd in
-    claude|codex|shell|rails|console|up|down|restart|start|stop|serve|logs|url|admin|rm|use|select|snapshot|snap)
+    claude|codex|imgpaste|shell|rails|console|up|down|restart|start|stop|serve|logs|url|admin|rm|use|select|snapshot|snap)
       if (( CURRENT == 3 )); then
         local -a boxes
         boxes=(${(f)"$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null)"})

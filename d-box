@@ -16,7 +16,10 @@ ADMIN_USER="${DBOX_ADMIN_USERNAME:-}"
 ADMIN_EMAIL="${DBOX_ADMIN_EMAIL:-}"
 ADMIN_PASS="${DBOX_ADMIN_PASSWORD:-}"
 
-APP_PORT="${DBOX_APP_PORT:-3000}"
+APP_PORT=3000
+AUTO_SERVE_MARKER="/var/lib/d-box/auto-serve"
+DEV_SERVICE_DIR="/etc/service/d-box-dev"
+TAILNET_PROXY="$DBOX_DIR/tailnet-proxy.rb"
 
 # optional: host source dir of the patch-triage MCP gem (baked into the image if present)
 PATCH_TRIAGE_MCP="${DBOX_PATCH_TRIAGE_MCP:-$HOME/work/discourse/patch-triage/mcp}"
@@ -30,6 +33,7 @@ PLAYWRIGHT_MCP="${DBOX_PLAYWRIGHT_MCP:-@playwright/mcp@0.0.75}"
 # currently Node 22, so default to the newest compatible release and let callers
 # opt into newer builds after the base image moves to Node 24.
 DISCOURSE_MCP="${DBOX_DISCOURSE_MCP:-@discourse/mcp@0.1.10}"
+PLAYWRIGHT_MCP_COMMAND="/usr/local/bin/d-box-playwright-mcp"
 
 # OrbStack/Docker-Desktop expose a STABLE host SSH-agent bridge at this fixed path.
 # Unlike $SSH_AUTH_SOCK (a per-boot macOS launchd path), it survives host reboots,
@@ -41,6 +45,7 @@ GITHUB_SSH_KEY="${DBOX_GITHUB_SSH_KEY:-id_rsa.discourse}"
 # reachable from your other tailnet devices. Set DBOX_EXPOSE=0 to disable.
 EXPOSE_TAILNET="${DBOX_EXPOSE:-1}"
 TS_BASE_PORT="${DBOX_TS_BASE_PORT:-3000}"   # first tailnet port to hand out
+TAILNET_HOST="steakbookpro.great-flops.ts.net"
 
 # manifest of files copied into each new box (live host files, so never stale).
 # one entry per line: "SOURCE" or "SOURCE -> DEST". See the file's own comments.
@@ -59,17 +64,21 @@ set_current() { mkdir -p "$DBOX_DIR/state"; printf '%s' "$1" > "$CURRENT_FILE"; 
 clear_current() { rm -f "$CURRENT_FILE"; }
 
 # is there a d-box box (container) with this name?
-box_present() { docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+box_present() {
+  docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null |
+    awk -v name="$1" '$0 == name { found = 1 } END { exit found ? 0 : 1 }'
+}
 
 # the default box, self-healing: if unset or pointing at a gone box, auto-adopt the
 # first existing box (and persist it) so there's always a default while ≥1 box exists.
 current_box() {
   local c=""
   [ -f "$CURRENT_FILE" ] && c="$(cat "$CURRENT_FILE" 2>/dev/null || true)"
-  if [ -n "$c" ] && box_present "$(slugify "$c")"; then printf '%s' "$c"; return; fi
+  if [ -n "$c" ] && box_present "$(slugify "$c")"; then printf '%s' "$c"; return 0; fi
   local first
-  first="$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | sed -n '1p' || true)"
-  [ -n "$first" ] && { set_current "$first"; printf '%s' "$first"; }
+  first="$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | awk 'NR == 1 { first = $0 } END { print first }' || true)"
+  [ -n "$first" ] && { set_current "$first"; printf '%s' "$first"; return 0; }
+  return 0
 }
 
 # resolve a box name for "act on a box" commands: explicit arg, else the current box
@@ -94,7 +103,28 @@ is_dbox() { [ "$(docker inspect -f '{{index .Config.Labels "d-box"}}' "$1" 2>/de
 ensure_running() {
   local cname="$1"
   container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
-  container_running "$cname" || { echo "starting $cname..."; docker start "$cname" >/dev/null; wait_pg "$cname"; }
+  ensure_restart_policy "$cname"
+  if ! container_running "$cname"; then
+    start_container_ordered "$cname"
+    expose_box "$cname"
+  fi
+}
+
+# Boxes that were running should return when OrbStack's Docker engine comes back.
+# `unless-stopped` preserves an explicit `d-box stop` across host reboots.
+ensure_restart_policy() {
+  local cname="$1" policy
+  policy="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cname" 2>/dev/null || true)"
+  [ "$policy" = "unless-stopped" ] && return 0
+  echo "==> enabling reboot recovery for $cname"
+  docker update --restart unless-stopped "$cname" >/dev/null
+}
+
+start_container_ordered() {
+  local cname="$1"
+  echo "starting $cname..."
+  docker start "$cname" >/dev/null
+  wait_pg "$cname"
 }
 
 wait_pg() {
@@ -137,20 +167,15 @@ run_db_migrations() {
   dexec "$cname" "LOAD_PLUGINS=1 bin/rake db:migrate && LOAD_PLUGINS=1 RAILS_ENV=test bin/rake db:migrate"
 }
 
-configure_app_url() {
-  local cname="$1" url host port
-  url="$(app_url_for "$cname")"
-  host="$(url_host "$url")"
-  port="$(url_port "$url")"
-  [ -n "$host" ] && [ -n "$port" ] || return 0
-  echo "==> canonical app URL: $url"
+clear_forced_hostname() {
+  local cname="$1"
+  echo "==> clearing forced Discourse hostname"
   local ruby='
-    SiteSetting.force_hostname = ENV.fetch("DBOX_CANONICAL_HOST")
-    SiteSetting.port = ENV.fetch("DBOX_CANONICAL_PORT")
-    puts "canonical: #{Discourse.base_url}"
+    SiteSetting.remove_override!(:force_hostname)
+    SiteSetting.remove_override!(:port)
+    puts "force_hostname: #{SiteSetting.force_hostname.inspect}, port: #{SiteSetting.port.inspect}"
   '
   printf '%s' "$ruby" | docker exec -i -u discourse:discourse -w /src -e HOME=/home/discourse \
-    -e DBOX_CANONICAL_HOST="$host" -e DBOX_CANONICAL_PORT="$port" \
     "$cname" bash -lc 'bundle exec rails runner -'
 }
 
@@ -276,21 +301,113 @@ sync_codex_auth_all() {
   echo "==> codex auth synced from $src"
 }
 
+# On macOS the LIVE claude oauth token (plus MCP oauth tokens) lives in the
+# Keychain; ~/.claude/.credentials.json is usually a stale leftover. Mirror the
+# newest source into a gitignored file under state/ so seeds and running boxes
+# can be refreshed from one path. Same contract as stage-seed.rb's lookup.
+prepare_claude_auth_source() {
+  local mirror="$DBOX_DIR/state/.claude-credentials.json" kc file
+  mkdir -p "$(dirname "$mirror")"
+
+  kc="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+  if [ -n "$kc" ]; then
+    printf '%s' "$kc" > "$mirror.tmp" && mv "$mirror.tmp" "$mirror"
+    chmod 600 "$mirror" 2>/dev/null || true
+    printf '%s' "$mirror"
+    return 0
+  fi
+
+  file="$HOME/.claude/.credentials.json"
+  if [ -f "$file" ]; then
+    cp -p "$file" "$mirror"
+    chmod 600 "$mirror" 2>/dev/null || true
+    printf '%s' "$mirror"
+    return 0
+  fi
+
+  printf ''
+}
+
+copy_claude_auth_to_seed() {
+  local src="$1" seed="$2" dest
+  [ -n "$src" ] && [ -n "$seed" ] || return 0
+  dest="$seed/.claude/.credentials.json"
+  mkdir -p "$(dirname "$dest")"
+  cp -p "$src" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
+copy_claude_auth_to_container() {
+  local src="$1" cname="$2"
+  [ -n "$src" ] && [ -n "$cname" ] || return 0
+  container_exists "$cname" || return 0
+  container_running "$cname" || return 0
+  docker exec -u root "$cname" mkdir -p /home/discourse/.claude
+  docker cp -L "$src" "$cname:/home/discourse/.claude/.credentials.json"
+  docker exec -u root "$cname" chown discourse:discourse /home/discourse/.claude/.credentials.json
+  docker exec -u root "$cname" chmod 600 /home/discourse/.claude/.credentials.json
+}
+
+sync_claude_auth() {
+  local cname="${1:-}" seed="${2:-}" src
+  src="$(prepare_claude_auth_source)"
+  if [ -z "$src" ]; then
+    echo "==> claude auth: no host credentials found (keychain or ~/.claude/.credentials.json)"
+    return 0
+  fi
+
+  copy_claude_auth_to_seed "$src" "$seed"
+  copy_claude_auth_to_container "$src" "$cname"
+  echo "==> claude auth synced from host"
+}
+
+sync_claude_auth_all() {
+  local src seed n
+  src="$(prepare_claude_auth_source)"
+  if [ -z "$src" ]; then
+    echo "==> claude auth: no host credentials found (keychain or ~/.claude/.credentials.json)"
+    return 0
+  fi
+
+  for seed in "$DBOX_DIR"/state/*/seed; do
+    [ -d "$seed" ] || continue
+    copy_claude_auth_to_seed "$src" "$seed"
+  done
+
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    copy_claude_auth_to_container "$src" "$n"
+  done < <(docker ps --filter label=d-box --format '{{.Names}}' 2>/dev/null || true)
+
+  echo "==> claude auth synced from host"
+}
+
 patch_playwright_mcp_configs() {
   local cname="$1"
   container_exists "$cname" || return 0
   container_running "$cname" || return 0
-  docker exec -u discourse:discourse -e HOME=/home/discourse -e DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" "$cname" ruby -rjson -e '
-    args = [
-      "-y",
-      ENV.fetch("DBOX_PLAYWRIGHT_MCP"),
-      "--executable-path",
-      "/usr/local/bin/chromium",
-      "--headless",
-      "--no-sandbox",
-    ]
+  docker exec -u root -e DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" "$cname" ruby -e '
+    wrapper = "/usr/local/bin/d-box-playwright-mcp"
+    File.write(wrapper, <<~BASH)
+      #!/usr/bin/env bash
+      set -euo pipefail
 
-    def patch_value(value, args)
+      export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}"
+      export CHROME_BIN="${CHROME_BIN:-/usr/local/bin/chromium}"
+      pkg="${DBOX_PLAYWRIGHT_MCP:-@playwright/mcp@0.0.75}"
+
+      if command -v playwright-mcp >/dev/null 2>&1; then
+        exec playwright-mcp --executable-path "$CHROME_BIN" --isolated --headless --no-sandbox "$@"
+      fi
+
+      exec npx -y "$pkg" --executable-path "$CHROME_BIN" --isolated --headless --no-sandbox "$@"
+    BASH
+    File.chmod(0o755, wrapper)
+  '
+  docker exec -u discourse:discourse -e HOME=/home/discourse -e DBOX_PLAYWRIGHT_MCP_COMMAND="$PLAYWRIGHT_MCP_COMMAND" "$cname" ruby -rjson -e '
+    command = ENV.fetch("DBOX_PLAYWRIGHT_MCP_COMMAND")
+
+    def patch_value(value, command)
       changed = false
       case value
       when Hash
@@ -298,13 +415,14 @@ patch_playwright_mcp_configs() {
           if child.is_a?(Hash) &&
              child["args"].is_a?(Array) &&
              child["args"].any? { |arg| arg.to_s.start_with?("@playwright/mcp") }
-            child["args"] = args
+            child["command"] = command
+            child["args"] = []
             changed = true
           end
-          changed = true if patch_value(child, args)
+          changed = true if patch_value(child, command)
         end
       when Array
-        value.each { |child| changed = true if patch_value(child, args) }
+        value.each { |child| changed = true if patch_value(child, command) }
       end
       changed
     end
@@ -322,7 +440,7 @@ patch_playwright_mcp_configs() {
         rescue JSON::ParserError
           next
         end
-        next unless patch_value(data, args)
+        next unless patch_value(data, command)
 
         File.write(path, JSON.pretty_generate(data) + "\n")
       end
@@ -331,7 +449,7 @@ patch_playwright_mcp_configs() {
     claude_json = File.join(ENV.fetch("HOME"), ".claude.json")
     if File.file?(claude_json)
       data = JSON.parse(File.read(claude_json))
-      if patch_value(data, args)
+      if patch_value(data, command)
         File.write(claude_json, JSON.pretty_generate(data) + "\n")
       end
     end
@@ -340,8 +458,8 @@ patch_playwright_mcp_configs() {
     if File.file?(codex_config)
       content = File.read(codex_config)
       content = content.gsub(
-        /args = \[[^\]]*"@playwright\/mcp[^"]*"[^\]]*\]/,
-        "args = [#{args.map(&:inspect).join(", ")}]"
+        /(\[mcp_servers\.playwright\]\n)(?:command = .*\n)?(?:args = .*\n)?/,
+        "\\1command = #{command.inspect}\nargs = []\n"
       )
       File.write(codex_config, content)
     end
@@ -361,26 +479,99 @@ ts_served_ports() {
     sort -u
 }
 
-# RAILS_DEVELOPMENT_HOSTS value for a box's dev server. Rails' leading-dot rule
-# (.ts.net) only permits ONE subdomain label, so the nested MagicDNS name
-# host.tailnet.ts.net (two labels) is blocked — it must be listed EXACTLY.
-dev_hosts() {
-  local h=".orb.local,.ts.net"
-  local d; d="$(ts_up && ts_dnsname || true)"
-  [ -n "$d" ] && h="$h,$d"
-  printf '%s' "$h"
-}
-
 local_url_for() {
   local slug="$1"
   printf 'http://%s.orb.local:%s' "$slug" "$APP_PORT"
 }
 
-tailnet_url_for() {
-  local slug="$1" port="${2:-}" dns=""
+local_host_for() {
+  local slug="$1"
+  printf '%s.orb.local' "$slug"
+}
+
+tailnet_host() {
   [ "$EXPOSE_TAILNET" = 1 ] || return 1
   ts_up || return 1
-  dns="$(ts_dnsname)"
+  printf '%s' "$TAILNET_HOST"
+}
+
+tailnet_enabled_for() {
+  local slug="$1"
+  [ "$EXPOSE_TAILNET" = 1 ] && [ ! -f "$DBOX_DIR/state/$slug/tailnet-disabled" ]
+}
+
+tailnet_proxy_label_for() { printf 'org.discourse.d-box.tailnet.%s' "$1"; }
+tailnet_proxy_plist_for() { printf '%s/state/%s/tailnet-proxy.plist' "$DBOX_DIR" "$1"; }
+tailnet_proxy_agent_for() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$(tailnet_proxy_label_for "$1")"; }
+
+tailnet_proxy_listening() {
+  lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+ensure_tailnet_proxy() {
+  local slug="$1" port="$2" label plist new_plist agent ruby_bin domain changed=0
+  label="$(tailnet_proxy_label_for "$slug")"
+  plist="$(tailnet_proxy_plist_for "$slug")"
+  new_plist="$plist.tmp"
+  agent="$(tailnet_proxy_agent_for "$slug")"
+  ruby_bin="/usr/bin/ruby"
+  domain="gui/$(id -u)"
+  mkdir -p "$(dirname "$plist")" "$(dirname "$agent")"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '  <key>Label</key><string>%s</string>\n' "$label"
+    printf '%s\n' '  <key>ProgramArguments</key><array>'
+    printf '    <string>%s</string>\n' "$ruby_bin" "$TAILNET_PROXY" "$port" "${slug}.orb.local" "$APP_PORT"
+    printf '%s\n' '  </array>'
+    printf '%s\n' '  <key>RunAtLoad</key><true/>'
+    printf '%s\n' '  <key>KeepAlive</key><true/>'
+    printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
+    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$DBOX_DIR/state/$slug/tailnet-proxy.log"
+    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$DBOX_DIR/state/$slug/tailnet-proxy.log"
+    printf '%s\n' '  <key>ThrottleInterval</key><integer>3</integer>'
+    printf '%s\n' '</dict></plist>'
+  } > "$new_plist"
+  if ! cmp -s "$new_plist" "$plist"; then
+    mv "$new_plist" "$plist"
+    changed=1
+  else
+    rm -f "$new_plist"
+  fi
+  ln -sf "$plist" "$agent"
+
+  if [ "$changed" = 1 ] && launchctl print "$domain/$label" >/dev/null 2>&1; then
+    launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+  fi
+  if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+    launchctl bootstrap "$domain" "$agent" >/dev/null
+  elif ! tailnet_proxy_listening "$port"; then
+    launchctl kickstart -k "$domain/$label" >/dev/null
+  fi
+
+  local i
+  for i in $(seq 1 20); do
+    tailnet_proxy_listening "$port" && return 0
+    sleep 0.25
+  done
+  echo "==> tailnet proxy failed for $slug — see: $DBOX_DIR/state/$slug/tailnet-proxy.log" >&2
+  return 1
+}
+
+remove_tailnet_proxy() {
+  local slug="$1" label domain agent
+  label="$(tailnet_proxy_label_for "$slug")"
+  domain="gui/$(id -u)"
+  agent="$(tailnet_proxy_agent_for "$slug")"
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+  rm -f "$agent"
+}
+
+tailnet_url_for() {
+  local slug="$1" port="${2:-}" dns=""
+  tailnet_enabled_for "$slug" || return 1
+  dns="$(tailnet_host)"
   [ -n "$dns" ] || return 1
   [ -n "$port" ] || port="$(ts_port_for "$slug")"
   [ -n "$port" ] || return 1
@@ -392,18 +583,59 @@ app_url_for() {
   tailnet_url_for "$slug" "$port" || local_url_for "$slug"
 }
 
+# Refuse to publish or teach agents any URL outside the two supported forms.
+# Keep these literals independent from the builders above so a future URL change
+# fails loudly instead of silently inventing another address.
+assert_url_contract() {
+  local slug="$1" port="${2:-}" local_url app_url expected_local expected_tail
+  local_url="$(local_url_for "$slug")"
+  app_url="$(app_url_for "$slug" "$port")"
+  expected_local="http://${slug}.orb.local:3000"
+  [ "$local_url" = "$expected_local" ] ||
+    die "URL contract violation: local URL must be $expected_local (got $local_url)"
+
+  if [ -n "$port" ]; then
+    expected_tail="http://steakbookpro.great-flops.ts.net:${port}"
+    [ "$app_url" = "$expected_local" ] || [ "$app_url" = "$expected_tail" ] ||
+      die "URL contract violation: app URL must be $expected_local or $expected_tail (got $app_url)"
+  else
+    [ "$app_url" = "$expected_local" ] ||
+      printf '%s' "$app_url" | grep -Eq '^http://steakbookpro\.great-flops\.ts\.net:[0-9]+$' ||
+      die "URL contract violation: unsupported app URL $app_url"
+  fi
+}
+
+app_host_for() {
+  local slug="$1" port="${2:-}" url
+  url="$(app_url_for "$slug" "$port")"
+  url_host "$url"
+}
+
+# RAILS_DEVELOPMENT_HOSTS value for a box's dev server. Keep the canonical
+# Tailscale host exact, and also allow the mnemonic per-box OrbStack hostname.
+dev_hosts_for() {
+  local slug="$1" hosts="" host local_host
+  host="$(tailnet_host || true)"
+  [ -n "$host" ] && hosts="$host"
+  local_host="$(local_host_for "$slug")"
+  case ",$hosts," in
+    *",$local_host,"*) ;;
+    *) hosts="${hosts:+$hosts,}$local_host" ;;
+  esac
+  printf '%s' "$hosts"
+}
+
 url_host() { printf '%s' "$1" | sed -E 's#^https?://([^:/]+).*#\1#'; }
 url_port() { printf '%s' "$1" | sed -nE 's#^https?://[^:/]+:([0-9]+).*#\1#p'; }
 
-# true if nothing on the host is already LISTENing on this loopback port (the box
-# publishes 3000 there, so a collision — e.g. your own dev server on 3000 — would
-# make `tailscale serve` proxy to the wrong app)
+# true if nothing on the host is already LISTENing on this loopback port
 port_free_on_host() { ! lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
 # echo this box's tailnet port — reuse the stored one, else allocate a free port
 # (skips ports taken by another serve, another box, or any host listener)
 ts_port_for() {
-  local slug="$1" pf="$DBOX_DIR/state/$slug/tailnet-port"
+  local slug="$1" pf
+  pf="$DBOX_DIR/state/$slug/tailnet-port"
   if [ -f "$pf" ]; then cat "$pf"; return; fi
   local used p
   used="$(ts_served_ports)"
@@ -418,14 +650,14 @@ ts_port_for() {
 # expose a box on the tailnet (best-effort; silently skips if tailscale isn't up)
 expose_box() {
   local slug="$1"
-  [ "$EXPOSE_TAILNET" = 1 ] || return 0
+  tailnet_enabled_for "$slug" || return 0
   ts_up || { echo "==> tailscale not running — skipping tailnet expose"; return 0; }
-  local port; port="$(ts_port_for "$slug")"
+  local port
+  port="$(ts_port_for "$slug")"
   [ -n "$port" ] || { echo "==> no free tailnet port — skipping expose"; return 0; }
-  # proxy via 127.0.0.1:<port> (the box publishes 3000 there) — tailscaled's
-  # sandboxed netextension can reach loopback but NOT the OrbStack bridge/orb.local.
+  ensure_tailnet_proxy "$slug" "$port" || return 0
   if "$(ts_bin)" serve --bg --http="$port" "http://127.0.0.1:$port" >/dev/null 2>&1; then
-    echo "tailnet: http://$(ts_dnsname):$port  (from your other tailnet devices)"
+    echo "tailnet: http://$TAILNET_HOST:$port  (from your other tailnet devices)"
   else
     echo "==> tailnet expose failed (tailscale serve)"
   fi
@@ -433,7 +665,8 @@ expose_box() {
 
 # remove a box's tailnet serve. MUST run before its state dir is deleted.
 unexpose_box() {
-  local slug="$1" t pf="$DBOX_DIR/state/$slug/tailnet-port"
+  local slug="$1" t pf
+  pf="$DBOX_DIR/state/$slug/tailnet-port"
   t="$(ts_bin)"; [ -n "$t" ] && [ -f "$pf" ] || return 0
   local port; port="$(cat "$pf" 2>/dev/null)"
   [ -n "$port" ] && "$t" serve --http="$port" off >/dev/null 2>&1 || true
@@ -490,12 +723,16 @@ apply_copy_manifest() {
 
 # tell the agents (claude + codex) the box's own URL, via files they read by default
 write_url_context() {
-  local cname="$1" url; url="$(app_url_for "$cname")"
+  local cname="$1" url local_url
+  assert_url_contract "$cname"
+  url="$(app_url_for "$cname")"
+  local_url="$(local_url_for "$cname")"
   local note="# d-box environment
 
 This is a disposable Discourse dev box. The running app is served at: ${url}
 - Admin UI: ${url}/admin
 - Logged in as admin user \`${ADMIN_USER:-admin}\` (also reachable via ${url}/session/${ADMIN_USER:-admin}/become).
+- Local shortcut: ${local_url}
 - Use this base URL for any browser/Playwright navigation in this box — NOT localhost.
 - The same value is in the \$DBOX_APP_URL environment variable."
   printf '%s\n' "$note" | docker exec -i -u discourse:discourse -e HOME=/home/discourse "$cname" \
@@ -506,34 +743,36 @@ This is a disposable Discourse dev box. The running app is served at: ${url}
 
 # launch a box container with the canonical run flags (single source of truth for
 # both `new` and `repair`). $6 = a node_modules volume to reuse (repair);
-# empty = the stable per-box volume name. $7 = host port to publish 3000 on
-# (127.0.0.1 only) so
-# `tailscale serve` can proxy via localhost — tailscaled's sandboxed netextension
-# can't reach the OrbStack bridge, only loopback. The ssh-agent uses the STABLE
+# empty = the stable per-box volume name. $7 = public tailnet port. The
+# container publishes no host ports; a launchd-supervised host bridge owns the
+# same incremental port used by Tailscale Serve. The ssh-agent uses the stable
 # bridge socket so the container stays startable across host reboots.
 run_box_container() {
-  local cname="$1" slug="$2" wt="$3" seed="$4" img="$5" nmvol="${6:-$(node_modules_volume_name "$slug")}" pubport="${7:-}"
+  local cname="$1" slug="$2" wt="$3" seed="$4" img="$5" nmvol tailport="${7:-}" generation
+  generation="${slug}-$(date +%s)-$$-$RANDOM"
+  nmvol="${6:-$(node_modules_volume_name "$slug")}"
   local nm_opt=(-v "$nmvol:/src/node_modules")
-  local pub_opt=()
   local app_url app_host
-  app_url="$(app_url_for "$slug" "$pubport")"
-  app_host="$(url_host "$app_url")"
-  [ -n "$pubport" ] && pub_opt=(-p "127.0.0.1:$pubport:3000")
+  app_url="$(app_url_for "$slug" "$tailport")"
+  app_host="$(app_host_for "$slug" "$tailport")"
+  assert_url_contract "$slug" "$tailport"
   docker run -d --name "$cname" --hostname "$cname" \
+    --restart unless-stopped \
     --label d-box=1 --label "d-box.slug=$slug" \
     -e CREATE_DB_ON_BOOT=1 -e PGUSER=discourse -e UNICORN_BIND_ALL=true \
     -e TESTEM_DEFAULT_BROWSER=Chromium \
     -e DISCOURSE_DISABLE_BROWSER_SANDBOX=1 \
     -e CHROME_BIN=/usr/local/bin/chromium \
-    -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
+    -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts_for "$slug")" \
     -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 \
+    -e "DBOX_CONTAINER_GENERATION=$generation" \
+    -e "DBOX_PLAYWRIGHT_MCP=$PLAYWRIGHT_MCP" \
     -e "DBOX_APP_URL=$app_url" \
     -e "DISCOURSE_HOSTNAME=$app_host" \
     -v "$wt:/src:delegated" \
     -v "$GIT_COMMON:$GIT_COMMON" \
     -v "$seed:/seed:ro" \
     -v "$DBOX_DIR/entrypoint.rb:/usr/local/bin/d-box-entrypoint:ro" \
-    "${pub_opt[@]+"${pub_opt[@]}"}" \
     "${nm_opt[@]}" \
     -v "$SSH_AGENT_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent \
     -e "DBOX_GITHUB_SSH_KEY=$GITHUB_SSH_KEY" \
@@ -590,19 +829,22 @@ cmd_new() {
   if container_exists "$cname"; then
     is_dbox "$cname" || die "a non-d-box container named '$cname' already exists — pick another branch name"
     echo "==> box already exists; starting"
-    container_running "$cname" || docker start "$cname" >/dev/null
+    container_running "$cname" || start_container_ordered "$cname"
   else
     local img; img="$(base_image)"
-    # allocate the box's tailnet port up front and publish 3000 there on 127.0.0.1
-    # so `tailscale serve` can proxy via loopback (see expose_box).
-    local pubport=""; [ "$EXPOSE_TAILNET" = 1 ] && pubport="$(ts_port_for "$slug")"
+    local tailport=""
+    if tailnet_enabled_for "$slug"; then
+      tailport="$(ts_port_for "$slug")"
+    fi
     echo "==> launching container $cname (from $img)"
-    run_box_container "$cname" "$slug" "$wt" "$seed" "$img" "" "$pubport"
+    run_box_container "$cname" "$slug" "$wt" "$seed" "$img" "" "$tailport"
   fi
 
+  ensure_restart_policy "$cname"
   wait_pg "$cname"
 
   sync_codex_auth "$cname" "$seed"
+  sync_claude_auth "$cname" "$seed"
   patch_playwright_mcp_configs "$cname"
   set_git_identity "$cname"
   write_url_context "$cname"
@@ -620,7 +862,7 @@ cmd_new() {
     echo "   pnpm install hiccup (attempt $i) — retrying in 5s"; sleep 5
   done
   run_db_migrations "$cname"
-  configure_app_url "$cname"
+  clear_forced_hostname "$cname"
 
   create_admin "$cname"
 
@@ -630,6 +872,7 @@ cmd_new() {
   fi
 
   if [ "$no_serve" = 1 ]; then
+    disable_auto_serve "$cname"
     echo
     echo "box ready: $cname (server not started — run: d-box up $branch)"
   else
@@ -688,6 +931,7 @@ cmd_claude() {
   [ -n "$branch" ] || die "no box given and no default set (d-box use <box>)"
   local cname="$(slugify "$branch")"
   ensure_running "$cname"
+  sync_claude_auth "$cname" "$DBOX_DIR/state/$cname/seed"
   patch_playwright_mcp_configs "$cname"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
     "$cname" claude --dangerously-skip-permissions "$@"
@@ -703,6 +947,94 @@ cmd_codex() {
   patch_playwright_mcp_configs "$cname"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
     "$cname" codex --dangerously-bypass-approvals-and-sandbox "$@"
+}
+
+cmd_imgpaste() {
+  [ $# -le 1 ] || die "usage: d-box imgpaste [box]"
+  local branch; branch="$(need_box "${1:-}")"
+  local cname; cname="$(slugify "$branch")"
+  local wt="$DBOX_DIR/worktrees/$cname"
+  [ -d "$wt" ] || die "no worktree for box '$cname' — run: d-box new <branch>"
+
+  local stamp filename dest suffix=1
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  filename="img-$stamp.png"
+  dest="$wt/tmp/$filename"
+  mkdir -p "$wt/tmp"
+  while [ -e "$dest" ]; do
+    filename="img-$stamp-$suffix.png"
+    dest="$wt/tmp/$filename"
+    suffix=$((suffix + 1))
+  done
+
+  # Finder copies files as both a file reference and a rendered preview. Prefer
+  # the referenced image; pngpaste otherwise captures Finder's generic file icon.
+  local clipboard_file=""
+  if [ "$(uname -s)" = "Darwin" ]; then
+    clipboard_file="$(/usr/bin/osascript 2>/dev/null <<'APPLESCRIPT' || true
+try
+  set clipboardFile to the clipboard as alias
+  return POSIX path of clipboardFile
+on error
+  return ""
+end try
+APPLESCRIPT
+)"
+  fi
+
+  if [ -n "$clipboard_file" ] && [ -f "$clipboard_file" ]; then
+    if ! /usr/bin/sips -s format png "$clipboard_file" --out "$dest" >/dev/null; then
+      rm -f "$dest"
+      die "clipboard file is not a supported image: $clipboard_file"
+    fi
+  elif command -v pngpaste >/dev/null 2>&1; then
+    if ! pngpaste "$dest"; then
+      rm -f "$dest"
+      die "clipboard does not contain an image"
+    fi
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    local raw="$wt/tmp/.imgpaste-$stamp-$$"
+    if ! /usr/bin/osascript - "$raw" >/dev/null <<'APPLESCRIPT'
+on run argv
+  set outputPath to item 1 of argv
+  try
+    set imageData to the clipboard as «class PNGf»
+  on error
+    try
+      set imageData to the clipboard as «class TIFF»
+    on error
+      error "clipboard does not contain an image"
+    end try
+  end try
+
+  set outputFile to open for access POSIX file outputPath with write permission
+  try
+    set eof outputFile to 0
+    write imageData to outputFile
+    close access outputFile
+  on error errorMessage number errorNumber
+    try
+      close access outputFile
+    end try
+    error errorMessage number errorNumber
+  end try
+end run
+APPLESCRIPT
+    then
+      rm -f "$raw"
+      die "clipboard does not contain an image"
+    fi
+    if ! /usr/bin/sips -s format png "$raw" --out "$dest" >/dev/null; then
+      rm -f "$raw" "$dest"
+      die "could not convert clipboard image to PNG"
+    fi
+    rm -f "$raw"
+  else
+    die "imgpaste requires pngpaste (install it with your package manager)"
+  fi
+
+  echo "saved $dest" >&2
+  printf '/src/tmp/%s\n' "$filename"
 }
 
 cmd_shell() {
@@ -737,16 +1069,19 @@ cmd_admin() {
 }
 
 cmd_serve() {
-  local cname; cname="$(slugify "$(need_box "${1:-}")")"
+  local branch; branch="$(need_box "${1:-}")"
+  local cname; cname="$(slugify "$branch")"
+  container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
   ensure_running "$cname"
   local app_url app_host
   app_url="$(app_url_for "$cname")"
-  app_host="$(url_host "$app_url")"
-  configure_app_url "$cname"
+  app_host="$(app_host_for "$cname")"
+  clear_forced_hostname "$cname"
+  write_url_context "$cname"
   echo "dev server starting — once it's up, open: $app_url"
   echo "(Ctrl-C stops the server; the box keeps running. Use 'd-box up' to run it in the background.)"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
-    -e UNICORN_BIND_ALL=true -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
+    -e UNICORN_BIND_ALL=true -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts_for "$cname")" \
     -e "DISCOURSE_HOSTNAME=$app_host" \
     -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 "$cname" bin/dev
 }
@@ -763,46 +1098,87 @@ dev_responds() {
 # linger after the bin/dev wrapper dies, so we escalate to -9 and verify)
 stop_dev() {
   local cname="$1" i
-  docker exec "$cname" bash -lc 'pkill -TERM -f "bin/dev"; pkill -TERM -f pitchfork; pkill -TERM -f rolldown; true' 2>/dev/null || true
+  pause_dev_service "$cname"
+  # Bracketed patterns match the target process names without matching this
+  # cleanup shell's own command line.
+  docker exec "$cname" bash -lc 'pkill -TERM -f "[b]in/dev"; pkill -TERM -f "[p]itchfork"; pkill -TERM -f "[r]olldown"; true' 2>/dev/null || true
   for i in $(seq 1 12); do dev_responds "$cname" || return 0; sleep 1; done
-  docker exec "$cname" bash -lc 'pkill -9 -f "bin/dev"; pkill -9 -f pitchfork; pkill -9 -f rolldown; true' 2>/dev/null || true
+  docker exec "$cname" bash -lc 'pkill -9 -f "[b]in/dev"; pkill -9 -f "[p]itchfork"; pkill -9 -f "[r]olldown"; true' 2>/dev/null || true
   for i in $(seq 1 8); do dev_responds "$cname" || return 0; sleep 1; done
   return 1   # still answering — couldn't free the port
 }
 
-# launch bin/dev detached (no waiting). Returns immediately; server compiles in bg.
+# Install the supervised dev service in an existing or new box. Existing boxes
+# bind-mount entrypoint.rb, so they can migrate without an image rebuild.
+ensure_dev_service() {
+  local cname="$1"
+  docker exec -u root "$cname" /usr/local/bin/d-box-entrypoint --install-dev-service >/dev/null
+}
+
+enable_auto_serve() {
+  local cname="$1" i
+  ensure_restart_policy "$cname"
+  ensure_dev_service "$cname"
+  docker exec -u root "$cname" bash -lc \
+    "touch '$AUTO_SERVE_MARKER'; rm -f '$DEV_SERVICE_DIR/down'"
+  # runsvdir notices dynamically-added services asynchronously on legacy boxes.
+  for i in $(seq 1 20); do
+    docker exec -u root "$cname" sv up "$DEV_SERVICE_DIR" >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  die "could not start the supervised dev service in $cname"
+}
+
+disable_auto_serve() {
+  local cname="$1"
+  ensure_restart_policy "$cname"
+  ensure_dev_service "$cname"
+  docker exec -u root "$cname" bash -lc \
+    "rm -f '$AUTO_SERVE_MARKER'; touch '$DEV_SERVICE_DIR/down'; sv down '$DEV_SERVICE_DIR' >/dev/null 2>&1 || true"
+}
+
+pause_dev_service() {
+  local cname="$1"
+  docker exec "$cname" test -x "$DEV_SERVICE_DIR/run" >/dev/null 2>&1 || return 0
+  docker exec -u root "$cname" sv down "$DEV_SERVICE_DIR" >/dev/null 2>&1 || true
+}
+
+dev_service_running() {
+  docker exec -u root "$1" sv status "$DEV_SERVICE_DIR" 2>/dev/null | grep -q '^run:'
+}
+
+# Start bin/dev under runit supervision (no waiting). The marker makes the same
+# service start automatically when OrbStack restores the container after reboot.
 start_dev_bg() {
   local cname="$1"
-  dev_responds "$cname" && return 0
-  local app_url app_host
-  app_url="$(app_url_for "$cname")"
-  app_host="$(url_host "$app_url")"
-  docker exec "$cname" bash -lc 'pkill -9 -f "bin/dev"; pkill -9 -f pitchfork; pkill -9 -f rolldown; true' 2>/dev/null || true
-  docker exec -d -u discourse:discourse -w /src -e HOME=/home/discourse \
-    -e UNICORN_BIND_ALL=true -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts)" \
-    -e "DISCOURSE_HOSTNAME=$app_host" \
-    -e DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1 "$cname" bash -lc 'bin/dev > /tmp/dev.log 2>&1'
+  ensure_restart_policy "$cname"
+  ensure_dev_service "$cname"
+  if dev_responds "$cname"; then
+    if dev_service_running "$cname"; then
+      enable_auto_serve "$cname"
+      return 0
+    fi
+    echo "migrating the running dev server to reboot-safe supervision..."
+    stop_dev "$cname" || die "could not stop the legacy dev server in $cname"
+  fi
+  enable_auto_serve "$cname"
 }
 
 # start the dev server in the BACKGROUND and WAIT until it's ready, print login URL
 cmd_up() {
   local branch; branch="$(need_box "${1:-}")"
   local cname="$(slugify "$branch")"
-  ensure_running "$cname"
-  configure_app_url "$cname"
-  if dev_responds "$cname"; then
+  container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
+  container_running "$cname" || start_container_ordered "$cname"
+  clear_forced_hostname "$cname"
+  write_url_context "$cname"
+  ensure_restart_policy "$cname"
+  ensure_dev_service "$cname"
+  if dev_responds "$cname" && dev_service_running "$cname"; then
+    enable_auto_serve "$cname"
     echo "dev server already running"
   else
-    echo "starting dev server in the background..."
-    start_dev_bg "$cname"
-    echo -n "waiting for it to be ready (first boot compiles assets)"
-    local i
-    for i in $(seq 1 90); do
-      dev_responds "$cname" && break
-      echo -n "."; sleep 3
-    done
-    echo
-    dev_responds "$cname" || echo "  (warning: not responding yet — check: d-box logs $branch)"
+    start_dev_and_wait "$cname" "$branch"
   fi
   local app_url; app_url="$(app_url_for "$cname")"
   echo "app:   $app_url"
@@ -811,18 +1187,38 @@ cmd_up() {
   echo "logs:  d-box logs $branch   |   stop: d-box down $branch"
 }
 
+start_dev_and_wait() {
+  local cname="$1" branch="$2" i
+  echo "starting dev server in the background..."
+  start_dev_bg "$cname"
+  echo -n "waiting for it to be ready (first boot compiles assets)"
+  for i in $(seq 1 90); do
+    dev_responds "$cname" && break
+    echo -n "."; sleep 3
+  done
+  echo
+  if ! dev_responds "$cname"; then
+    echo "error: dev server failed to start — check: d-box logs $branch" >&2
+    return 1
+  fi
+}
+
 # stop the background dev server (box keeps running)
 cmd_down() {
   local cname; cname="$(slugify "$(need_box "${1:-}")")"
   container_running "$cname" || die "box '$cname' is not running"
+  disable_auto_serve "$cname"
   if stop_dev "$cname"; then
-    echo "dev server stopped (box still running — use 'd-box stop' to stop the container)"
+    echo "dev server stopped and reboot auto-serving disabled"
+    echo "box is still running — use 'd-box up' to serve it again or 'd-box stop' to stop the container"
   else
     echo "warning: something still answers on :3000 in $cname"
   fi
 }
 
-# stop the whole container (graceful server shutdown first; data is preserved)
+# Stop the whole container (graceful server shutdown first; data is preserved).
+# Keep the auto-serve marker so an explicit later `start` restores the prior state;
+# Docker's unless-stopped policy still keeps this container off across host reboots.
 cmd_stop() {
   local branch; branch="$(need_box "${1:-}")"
   local cname="$(slugify "$branch")"
@@ -833,26 +1229,41 @@ cmd_stop() {
   echo "box stopped — run 'd-box start $branch' to start it again"
 }
 
-# start the container (does NOT launch the dev server — use 'd-box up' for that)
+# Start the container. If `up` was enabled before it stopped, runit resumes the
+# dev server; a preceding `down` keeps it disabled.
 cmd_start() {
   local branch; branch="$(need_box "${1:-}")"
   local cname="$(slugify "$branch")"
   container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
+  ensure_restart_policy "$cname"
   if container_running "$cname"; then
     echo "box '$cname' is already running"
   else
-    echo "starting $cname..."; docker start "$cname" >/dev/null; wait_pg "$cname"
+    start_container_ordered "$cname"
+    expose_box "$cname"
   fi
-  echo "box started — run 'd-box up $branch' to start the dev server"
+  if docker exec "$cname" test -f "$AUTO_SERVE_MARKER" >/dev/null 2>&1; then
+    echo "box started — its dev server will resume automatically"
+  else
+    echo "box started — run 'd-box up $branch' to enable the dev server"
+  fi
 }
 
 # restart: stop fully, then start
 cmd_restart() {
   local branch; branch="$(need_box "${1:-}")"
   local cname="$(slugify "$branch")"
-  ensure_running "$cname"
+  container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
+  container_running "$cname" || die "box '$cname' is stopped — run: d-box start $branch"
   echo "stopping dev server..."; stop_dev "$cname" || echo "  (warning: couldn't fully stop)"
-  cmd_up "$branch"
+  clear_forced_hostname "$cname"
+  write_url_context "$cname"
+  start_dev_and_wait "$cname" "$branch"
+  local app_url; app_url="$(app_url_for "$cname")"
+  echo "app:   $app_url"
+  [ -n "$ADMIN_PASS" ] && echo "login: $app_url/session/${ADMIN_USER:-admin}/become"
+  expose_box "$cname"
+  echo "logs:  d-box logs $branch   |   stop: d-box down $branch"
 }
 
 # rebuild a box's container in place — fixes a container that won't start because of
@@ -861,6 +1272,8 @@ cmd_restart() {
 # volume is re-attached by name, and the worktree is a bind mount that's never touched.
 cmd_repair() {
   local branch; branch="$(need_box "${1:-}")"
+  local no_serve=0
+  [ "${2:-}" = "--no-serve" ] && no_serve=1
   local slug; slug="$(slugify "$branch")"; local cname="$slug"
   local wt="$DBOX_DIR/worktrees/$slug" seed="$DBOX_DIR/state/$slug/seed"
   container_exists "$cname" || die "no container '$cname' to repair"
@@ -868,6 +1281,10 @@ cmd_repair() {
   [ -d "$wt" ] || die "worktree missing at $wt — cannot repair"
 
   echo "==> repairing $cname (preserving DB + node_modules + worktree)"
+  if [ "$no_serve" = 1 ] && container_running "$cname"; then
+    disable_auto_serve "$cname"
+    stop_dev "$cname" || echo "  (warning: couldn't fully stop the dev server before repair)"
+  fi
   local tmp="$IMAGE_REPO:repair-$slug"
   container_running "$cname" && docker exec -u postgres "$cname" psql -c CHECKPOINT >/dev/null 2>&1 || true
   echo "   committing current state -> $tmp"
@@ -885,16 +1302,25 @@ cmd_repair() {
   docker rm -f "$cname" >/dev/null 2>&1 || true
   echo "   recreating with the stable ssh-agent mount"
   sync_codex_auth "" "$seed"
-  local pubport=""; [ "$EXPOSE_TAILNET" = 1 ] && pubport="$(ts_port_for "$slug")"
-  run_box_container "$cname" "$slug" "$wt" "$seed" "$tmp" "$nmvol" "$pubport"
+  sync_claude_auth "" "$seed"
+  local tailport=""
+  if tailnet_enabled_for "$slug"; then
+    tailport="$(ts_port_for "$slug")"
+  fi
+  run_box_container "$cname" "$slug" "$wt" "$seed" "$tmp" "$nmvol" "$tailport"
   wait_pg "$cname"
   sync_codex_auth "$cname" "$seed"
+  sync_claude_auth "$cname" "$seed"
   patch_playwright_mcp_configs "$cname"
   if [ -n "$old_nmvol" ] && [ "$old_nmvol" != "$nmvol" ]; then
     docker volume rm "$old_nmvol" >/dev/null 2>&1 || true
   fi
-  set_git_identity "$cname"; configure_app_url "$cname"; write_url_context "$cname"; expose_box "$slug"
-  echo "==> starting dev server in the background"; start_dev_bg "$cname"
+  set_git_identity "$cname"; clear_forced_hostname "$cname"; write_url_context "$cname"; expose_box "$slug"
+  if [ "$no_serve" = 0 ]; then
+    echo "==> starting dev server in the background"; start_dev_bg "$cname"
+  else
+    disable_auto_serve "$cname"
+  fi
   echo; echo "repaired: $cname  ->  $(app_url_for "$cname")"
 }
 
@@ -907,6 +1333,7 @@ cmd_logs() {
 cmd_url() {
   local cname; cname="$(slugify "$(need_box "${1:-}")")"
   container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
+  assert_url_contract "$cname"
   echo "app:     $(app_url_for "$cname")"
   echo "local:   $(local_url_for "$cname")"
   expose_box "$cname"
@@ -957,6 +1384,13 @@ cmd_rmsnap() {
   local tag="$IMAGE_REPO:snap-$(slugify "$name")"
   [ "$(base_image)" = "$tag" ] && rm -f "$BASE_IMAGE_FILE"
   docker rmi "$tag" >/dev/null 2>&1 && echo "removed $tag" || die "no snapshot '$name'"
+}
+
+# push the host's current claude + codex credentials into every seed and every
+# running box. Useful after re-logging in on the host without attaching to a box.
+cmd_auth() {
+  sync_claude_auth_all
+  sync_codex_auth_all
 }
 
 # set or show the default ("current") box
@@ -1043,6 +1477,7 @@ cmd_rm() {
   done
   docker rmi "$IMAGE_REPO:repair-$slug" >/dev/null 2>&1 || true   # drop any repair image left as the box's base
   unexpose_box "$slug"   # drop the tailnet serve BEFORE deleting its state dir
+  remove_tailnet_proxy "$slug"
   git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
   git -C "$REPO" worktree prune 2>/dev/null || true   # clear any stale registration
   rm -rf "$DBOX_DIR/state/$slug"
@@ -1060,7 +1495,6 @@ cmd_rm() {
 
 cmd_build() {
   local base_tag="${DBOX_IMAGE%%:*}:base"
-  sync_codex_auth_all
   echo "==> building base image $base_tag (from $BASE_IMAGE)"
   docker build --build-arg "BASE=$BASE_IMAGE" --build-arg "PLAYWRIGHT_MCP=$PLAYWRIGHT_MCP" \
     --build-arg "DISCOURSE_MCP=$DISCOURSE_MCP" \
@@ -1138,7 +1572,7 @@ cmd_build() {
     docker rm -f "$cr" >/dev/null 2>&1 || true
     docker run -d --name "$cr" --entrypoint sleep "$base" infinity >/dev/null
     docker exec -u root "$cr" npm install -g \
-      @anthropic-ai/claude-code@latest @openai/codex@latest "$DISCOURSE_MCP"
+      @anthropic-ai/claude-code@latest @openai/codex@latest "$DISCOURSE_MCP" "$PLAYWRIGHT_MCP"
     # restore the real entrypoint/cmd — docker commit otherwise bakes the `sleep`
     # override into the image and new boxes would never boot the stack.
     docker commit \
@@ -1161,12 +1595,13 @@ d-box — disposable Claude + Codex sandbox boxes
   d-box use   [box]                 set (or, with no arg, show) the default box
   d-box claude [box] [args...]      launch YOLO claude inside the box (pass -c/--resume to continue a session)
   d-box codex  [box] [args...]      launch full-bypass codex inside the box
+  d-box imgpaste [box]              save the host clipboard image in the box's tmp directory
   d-box shell  [box]                bash prompt inside the box
   d-box rails  [box] ["ruby"]       rails console (or run ruby in the rails env)
-  d-box up     [box]                start the dev server in the background, print login URL
-  d-box down   [box]                stop the background dev server (container keeps running)
+  d-box up     [box]                start dev server + enable reboot auto-serving
+  d-box down   [box]                stop dev server + disable reboot auto-serving
   d-box restart [box]               stop the dev server fully, then start it again
-  d-box start  [box]                start the container (does not launch the dev server)
+  d-box start  [box]                start the container + resume its enabled dev server
   d-box stop   [box]                stop the container (keeps DB + volumes; reverse of start)
   d-box repair  [box]               rebuild a box's container in place (fixes a broken mount; keeps DB + worktree)
   d-box serve  [box]                run the dev server in the foreground (live logs)
@@ -1175,6 +1610,7 @@ d-box — disposable Claude + Codex sandbox boxes
   d-box admin  [box]                (re)create the admin user
   d-box list (or ls)                list boxes (with URLs, * = default) + worktrees
   d-box rm    [box] [--delete-branch]   tear down box, volumes, worktree, seed
+  d-box auth                        push host claude+codex auth into all seeds + boxes
 
   d-box snapshot [box] [name]       save a box's state (DB + system) as a reusable image
   d-box snapshots                   list snapshots + the active base
@@ -1183,7 +1619,7 @@ d-box — disposable Claude + Codex sandbox boxes
 
 files listed in $DBOX_DIR/copy-files are copied into every new box (see that file's comments)
 
-env (via $DBOX_DIR/.env): DBOX_IMAGE, DBOX_BASE, DBOX_REPO, DBOX_BASE_BRANCH, DBOX_DISCOURSE_MCP, DBOX_GITHUB_SSH_KEY
+env (via $DBOX_DIR/.env): DBOX_IMAGE, DBOX_BASE, DBOX_REPO, DBOX_BASE_BRANCH, DBOX_DISCOURSE_MCP, DBOX_PLAYWRIGHT_MCP, DBOX_GITHUB_SSH_KEY, DBOX_TS_BASE_PORT
 EOF
 }
 
@@ -1193,6 +1629,7 @@ case "$cmd" in
   new)    cmd_new "$@" ;;
   claude) cmd_claude "$@" ;;
   codex)  cmd_codex "$@" ;;
+  imgpaste) cmd_imgpaste "$@" ;;
   shell)  cmd_shell "$@" ;;
   rails|console) cmd_rails "$@" ;;
   admin)  cmd_admin "$@" ;;
@@ -1205,6 +1642,7 @@ case "$cmd" in
   serve)  cmd_serve "$@" ;;
   logs)   cmd_logs "$@" ;;
   url)    cmd_url "$@" ;;
+  auth)   cmd_auth "$@" ;;
   use|select) cmd_use "$@" ;;
   snapshot|snap) cmd_snapshot "$@" ;;
   snapshots|snaps) cmd_snapshots "$@" ;;
