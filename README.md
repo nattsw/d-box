@@ -17,12 +17,14 @@ cp .env.example .env      # optional — defaults assume ~/work/discourse/discou
 ./d-box new my-feature            # worktree + box on branch my-feature (off main)
 ./d-box claude my-feature         # attach to YOLO claude inside the box
 ./d-box codex  my-feature         # attach to full-bypass codex inside the box
+./d-box update-codex              # update Codex; infer box from worktree cwd
 ./d-box imgpaste my-feature       # save clipboard image to /src/tmp/img-<timestamp>.png
 ./d-box shell  my-feature         # bash prompt inside the box
 ./d-box list                      # list boxes + worktrees
 ./d-box rm     my-feature         # tear down container + volumes + worktree + seed
 ./d-box rm     my-feature --delete-branch
 ./d-box auth                      # push host claude+codex auth to all boxes
+./d-box config                    # refresh sanitized Codex config in all boxes
 ```
 
 Attach the current clipboard image when launching Codex:
@@ -33,6 +35,10 @@ Attach the current clipboard image when launching Codex:
 
 `new` is the slow step (bundle + pnpm + db migrate). After that, `claude`/`codex`/`shell`
 attach instantly. Run several boxes at once for parallel tasks — they don't collide.
+
+From anywhere inside `worktrees/<box>/`, `update-codex` derives the container name
+from the enclosing worktree. You can also pass a box explicitly, or run it elsewhere
+to use the current box selected by `d-box use`.
 
 ## How it works
 
@@ -54,8 +60,12 @@ attach instantly. Run several boxes at once for parallel tasks — they don't co
     after OrbStack and Docker recover from a host reboot. `d-box down` records an
     explicit opt-out; `d-box up` turns reboot auto-serving back on.
     Every box has exactly two supported URLs: `http://<slug>.orb.local:3000`
-    locally and `http://steakbookpro.great-flops.ts.net:<incremental-port>` on
-    the tailnet. A launchd-supervised host bridge uses that same incremental
+    as the canonical app URL and `http://steakbookpro.great-flops.ts.net:<incremental-port>`
+    as a secondary URL on the tailnet. Rails allows both hostnames; Discourse's
+    hostname and agent URL context use the OrbStack address.
+    Tailnet ports start at 3001; host port 3000 is reserved for local development.
+    Existing port 3000 assignments are replaced when d-box next allocates the box's port.
+    A launchd-supervised host bridge uses that same incremental
     port internally, so Docker publishes no host ports and d-box does not
     introduce a third URL or a separate backend-port range.
 - **Image** (`Dockerfile`): base `discourse/discourse_dev` + `claude`, `codex`,
@@ -84,6 +94,11 @@ attach instantly. Run several boxes at once for parallel tasks — they don't co
   Codex token from `$DBOX_REPO/.codex/auth.json` or `~/.codex/auth.json`
   into box seeds and running boxes. The host token is mirrored into the repo-local
   `.codex/auth.json` path, which is ignored by git. Tokens are not baked into images.
+- **Codex config refresh**: `new`, `repair`, and `codex` regenerate the box's
+  `~/.codex/config.toml` from the current host configuration. `d-box config` pushes
+  it into every existing seed and running box. macOS-only and unrelated host MCPs
+  are disabled in boxes; `GITHUB_PAT`, when available, is forwarded only to the
+  launched Codex process rather than persisted in Docker's container environment.
 - **Git**: the worktree's `.git` points at the main repo's `.git` by absolute host path,
   so the launcher bind-mounts the shared `.git` at its identical path. Commits land in
   the shared object store (visible from the host). Run `git worktree` admin on the host.

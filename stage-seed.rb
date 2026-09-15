@@ -6,6 +6,7 @@
 # projects' state are never reachable by the sandboxed agent.
 #
 # usage: stage-seed.rb <seed_out_dir>
+#        DBOX_CODEX_CONFIG_ONLY=1 stage-seed.rb <config_out_file>
 
 require "json"
 require "fileutils"
@@ -26,7 +27,15 @@ HOST_MEMORY = File.join(HOST_HOME, ".claude/projects/-Users-natalie-work-discour
 PLAYWRIGHT_MCP = ENV["DBOX_PLAYWRIGHT_MCP"] # e.g. "@playwright/mcp@0.0.75"
 PLAYWRIGHT_MCP_COMMAND = "/usr/local/bin/d-box-playwright-mcp"
 
+# These MCPs belong to the macOS ChatGPT app or unrelated host projects. Their
+# commands and OAuth state do not exist in a Linux Discourse box, so carrying an
+# enabled host definition into the box can only produce startup warnings.
+BOX_UNAVAILABLE_CODEX_MCPS = %w[node_repl computer-use cua_repl supabase vercel cats].freeze
+
 def rewrite(str)
+  # Rewrite the repo before the home directory, otherwise repo-local paths turn
+  # into /home/discourse/work/... and never get a chance to become /src.
+  str = str.gsub(HOST_REPO, "/src")
   str = str.gsub(HOST_HOME, BOX_HOME)
   if PLAYWRIGHT_MCP && !PLAYWRIGHT_MCP.empty?
     # Pin the @playwright/mcp version and force it through d-box's Chromium
@@ -127,9 +136,9 @@ def toml_table_header(line)
 end
 
 def toml_assignment_keys(lines)
-  lines.filter_map do |line|
+  lines.map do |line|
     line[/\A\s*((?:[A-Za-z0-9_-]+|"(?:\\.|[^"])*"|'[^']*'))\s*=/, 1]
-  end
+  end.compact
 end
 
 def merge_toml_tables(content, extra, label:)
@@ -215,6 +224,146 @@ def patch_playwright_toml(content)
   content.gsub(/(\[mcp_servers\.playwright\]\n)(?:command = .*\n)?(?:args = .*\n)?/) do
     "#{$1}command = #{PLAYWRIGHT_MCP_COMMAND.inspect}\nargs = []\n"
   end
+end
+
+def patch_github_mcp_url(content)
+  content.gsub(
+    'url = "https://api.githubcopilot.com/mcp"',
+    'url = "https://api.githubcopilot.com/mcp/"',
+  )
+end
+
+def set_mcp_server_enabled(content, name, enabled)
+  table = Regexp.escape(name)
+  pattern = /(^\[mcp_servers\.#{table}\][^\n]*\n)(.*?)(?=^\[|\z)/m
+
+  content.sub(pattern) do |section|
+    lines = section.lines
+    header = lines.shift
+    body = lines.join
+    setting = "enabled = #{enabled}\n"
+
+    if body.match?(/^\s*enabled\s*=/)
+      body = body.sub(/^\s*enabled\s*=.*(?:\n|\z)/, setting)
+    else
+      body = setting + body
+    end
+
+    header + body
+  end
+end
+
+def remove_root_toml_settings(content, keys)
+  root, tables = split_leading_root_toml(content)
+  pattern = /^\s*(?:#{keys.map { |key| Regexp.escape(key) }.join("|")})\s*=.*(?:\n|\z)/
+  root.gsub(pattern, "") + tables
+end
+
+def set_root_toml_setting(content, key, value)
+  root, tables = split_leading_root_toml(content)
+  setting = "#{key} = #{value}\n"
+  pattern = /^\s*#{Regexp.escape(key)}\s*=.*(?:\n|\z)/
+
+  if root.match?(pattern)
+    root = root.sub(pattern, setting)
+  else
+    root += setting
+  end
+
+  root + tables
+end
+
+def remove_toml_tables(content)
+  dropping = false
+
+  content.lines.map do |line|
+    if (header = toml_table_header(line))
+      dropping = yield(header)
+    end
+    line unless dropping
+  end.compact.join
+end
+
+def set_toml_table_enabled(content, header, enabled)
+  pattern = /(^#{Regexp.escape(header)}[^\n]*\n)(.*?)(?=^\[|\z)/m
+
+  content.sub(pattern) do |section|
+    lines = section.lines
+    table_header = lines.shift
+    body = lines.join
+    setting = "enabled = #{enabled}\n"
+
+    if body.match?(/^\s*enabled\s*=/)
+      body = body.sub(/^\s*enabled\s*=.*(?:\n|\z)/, setting)
+    else
+      body = setting + body
+    end
+
+    table_header + body
+  end
+end
+
+def sanitize_codex_container_config(content)
+  # Permission profiles and app tool bridges are host concerns. Inside d-box,
+  # Docker is the security boundary and Codex must not try to nest bwrap.
+  content = remove_root_toml_settings(
+    content,
+    %w[approvals_reviewer default_permissions notify],
+  )
+  content = remove_toml_tables(content) do |header|
+    header.start_with?("[permissions.")
+  end
+  content = set_root_toml_setting(content, "approval_policy", '"never"')
+  content = set_root_toml_setting(content, "sandbox_mode", '"danger-full-access"')
+  content = set_toml_table_enabled(
+    content,
+    '[plugins."codex-app-tools@openai-bundled"]',
+    false,
+  )
+  set_toml_table_enabled(
+    content,
+    '[plugins."computer-use@openai-bundled"]',
+    false,
+  )
+end
+
+def build_codex_config
+  codex_config = File.join(HOST_HOME, ".codex/config.toml")
+  return unless File.exist?(codex_config)
+
+  content = rewrite(File.read(codex_config))
+  # The box always represents the Discourse repo, so fold its project-scoped
+  # config into the box's global config at ~/.codex/config.toml.
+  repo_codex = File.join(HOST_REPO, ".codex/config.toml")
+  if File.exist?(repo_codex)
+    repo_root, repo_tables = split_leading_root_toml(rewrite(File.read(repo_codex)))
+    content = prepend_root_toml(content, repo_root)
+    content = merge_toml_tables(
+      content,
+      repo_tables,
+      label: "discourse project MCPs folded in from repo .codex/config.toml",
+    )
+  end
+
+  content = patch_playwright_toml(content)
+  content = patch_github_mcp_url(content)
+  content = sanitize_codex_container_config(content)
+  BOX_UNAVAILABLE_CODEX_MCPS.each do |name|
+    content = set_mcp_server_enabled(content, name, false)
+  end
+  if ENV.fetch("GITHUB_PAT", "").empty?
+    content = set_mcp_server_enabled(content, "github", false)
+  end
+  content
+end
+
+if ENV["DBOX_CODEX_CONFIG_ONLY"] == "1"
+  content = build_codex_config
+  abort "stage-seed: no host Codex config found" unless content
+
+  write(SEED, content)
+  File.chmod(0o600, SEED)
+  exit
 end
 
 FileUtils.rm_rf(SEED)
@@ -304,23 +453,11 @@ codex_machine_skills = []
 codex_machine_skills.concat(copy_skill_dirs(codex_skills, File.join(agents_seed, "skills")))
 codex_machine_skills.concat(copy_skill_dirs(AGENT_CONFIG_SKILLS, File.join(agents_seed, "skills")))
 codex_machine_skills.uniq!
-codex_config = File.join(HOST_HOME, ".codex/config.toml")
-if File.exist?(codex_config)
-  content = rewrite(File.read(codex_config))
-  # The discourse MCPs are project-scoped on the host (repo .codex/config.toml),
-  # so the global codex config is lean. The box runs codex at /src and is always
-  # discourse, so fold the repo's project servers into the box's global config.
-  repo_codex = File.join(HOST_HOME, "work/discourse/discourse/.codex/config.toml")
-  if File.exist?(repo_codex)
-    repo_root, repo_tables = split_leading_root_toml(rewrite(File.read(repo_codex)))
-    content = prepend_root_toml(content, repo_root)
-    content = merge_toml_tables(
-      content,
-      repo_tables,
-      label: "discourse project MCPs folded in from repo .codex/config.toml",
-    )
-  end
-  write(File.join(codex_seed, "config.toml"), patch_playwright_toml(content))
+content = build_codex_config
+if content
+  path = File.join(codex_seed, "config.toml")
+  write(path, content)
+  File.chmod(0o600, path)
 end
 
 # ---- plugins: rewrite host paths + pinned MCP packages in copied config ----

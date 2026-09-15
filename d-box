@@ -44,7 +44,7 @@ GITHUB_SSH_KEY="${DBOX_GITHUB_SSH_KEY:-id_rsa.discourse}"
 # Tailnet exposure: every new box gets a `tailscale serve` proxy on its own port,
 # reachable from your other tailnet devices. Set DBOX_EXPOSE=0 to disable.
 EXPOSE_TAILNET="${DBOX_EXPOSE:-1}"
-TS_BASE_PORT="${DBOX_TS_BASE_PORT:-3000}"   # first tailnet port to hand out
+TS_BASE_PORT="${DBOX_TS_BASE_PORT:-3001}"   # first tailnet port to hand out
 TAILNET_HOST="steakbookpro.great-flops.ts.net"
 
 # manifest of files copied into each new box (live host files, so never stale).
@@ -79,6 +79,22 @@ current_box() {
   first="$(docker ps -a --filter label=d-box --format '{{.Names}}' 2>/dev/null | awk 'NR == 1 { first = $0 } END { print first }' || true)"
   [ -n "$first" ] && { set_current "$first"; printf '%s' "$first"; return 0; }
   return 0
+}
+
+# Infer the box from a cwd anywhere under stateful worktrees/<box>/. This makes
+# commands launched from a box worktree follow that worktree instead of the
+# separately selected default box.
+box_from_worktree_cwd() {
+  local cwd root rel box
+  cwd="$(pwd -P)"
+  root="$(cd "$DBOX_DIR/worktrees" 2>/dev/null && pwd -P)" || return 0
+  case "$cwd" in
+    "$root"/*)
+      rel="${cwd#"$root"/}"
+      box="${rel%%/*}"
+      [ -n "$box" ] && box_present "$(slugify "$box")" && printf '%s' "$box"
+      ;;
+  esac
 }
 
 # resolve a box name for "act on a box" commands: explicit arg, else the current box
@@ -299,6 +315,74 @@ sync_codex_auth_all() {
   done < <(docker ps --filter label=d-box --format '{{.Names}}' 2>/dev/null || true)
 
   echo "==> codex auth synced from $src"
+}
+
+stage_codex_config() {
+  local dest="$1" tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+  if ! DBOX_PLAYWRIGHT_MCP="$PLAYWRIGHT_MCP" \
+       DBOX_REPO="$REPO" \
+       DBOX_CODEX_CONFIG_ONLY=1 \
+       ruby "$DBOX_DIR/stage-seed.rb" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
+copy_codex_config_to_seed() {
+  local src="$1" seed="$2" dest
+  [ -n "$src" ] && [ -n "$seed" ] || return 0
+  dest="$seed/.codex/config.toml"
+  mkdir -p "$(dirname "$dest")"
+  cp -p "$src" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
+copy_codex_config_to_container() {
+  local src="$1" cname="$2"
+  [ -n "$src" ] && [ -n "$cname" ] || return 0
+  container_exists "$cname" || return 0
+  container_running "$cname" || return 0
+  docker exec -u root "$cname" mkdir -p /home/discourse/.codex
+  docker cp -L "$src" "$cname:/home/discourse/.codex/config.toml"
+  docker exec -u root "$cname" chown discourse:discourse /home/discourse/.codex/config.toml
+  docker exec -u root "$cname" chmod 600 /home/discourse/.codex/config.toml
+}
+
+sync_codex_config() {
+  local cname="${1:-}" seed="${2:-}" config
+  [ -n "$seed" ] || return 0
+  config="$seed/.codex/config.toml"
+  stage_codex_config "$config"
+  copy_codex_config_to_container "$config" "$cname"
+  echo "==> codex config synced from host"
+}
+
+sync_codex_config_all() {
+  local config seed n containers
+  mkdir -p "$DBOX_DIR/state"
+  config="$(mktemp "$DBOX_DIR/state/.codex-config.XXXXXX")"
+  stage_codex_config "$config"
+
+  for seed in "$DBOX_DIR"/state/*/seed; do
+    [ -d "$seed" ] || continue
+    copy_codex_config_to_seed "$config" "$seed"
+  done
+
+  if ! containers="$(docker ps --filter label=d-box --format '{{.Names}}')"; then
+    rm -f "$config"
+    die "could not list running boxes; seed configs were refreshed but containers were not"
+  fi
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    copy_codex_config_to_container "$config" "$n"
+  done <<< "$containers"
+
+  rm -f "$config"
+  echo "==> codex config synced into all seeds and running boxes"
 }
 
 # On macOS the LIVE claude oauth token (plus MCP oauth tokens) lives in the
@@ -579,50 +663,32 @@ tailnet_url_for() {
 }
 
 app_url_for() {
-  local slug="$1" port="${2:-}"
-  tailnet_url_for "$slug" "$port" || local_url_for "$slug"
+  local_url_for "$1"
 }
 
 # Refuse to publish or teach agents any URL outside the two supported forms.
 # Keep these literals independent from the builders above so a future URL change
 # fails loudly instead of silently inventing another address.
 assert_url_contract() {
-  local slug="$1" port="${2:-}" local_url app_url expected_local expected_tail
+  local slug="$1" port="${2:-}" local_url app_url expected_local
   local_url="$(local_url_for "$slug")"
   app_url="$(app_url_for "$slug" "$port")"
   expected_local="http://${slug}.orb.local:3000"
   [ "$local_url" = "$expected_local" ] ||
     die "URL contract violation: local URL must be $expected_local (got $local_url)"
 
-  if [ -n "$port" ]; then
-    expected_tail="http://steakbookpro.great-flops.ts.net:${port}"
-    [ "$app_url" = "$expected_local" ] || [ "$app_url" = "$expected_tail" ] ||
-      die "URL contract violation: app URL must be $expected_local or $expected_tail (got $app_url)"
-  else
-    [ "$app_url" = "$expected_local" ] ||
-      printf '%s' "$app_url" | grep -Eq '^http://steakbookpro\.great-flops\.ts\.net:[0-9]+$' ||
-      die "URL contract violation: unsupported app URL $app_url"
-  fi
+  [ "$app_url" = "$expected_local" ] ||
+    die "URL contract violation: app URL must be $expected_local (got $app_url)"
 }
 
 app_host_for() {
-  local slug="$1" port="${2:-}" url
-  url="$(app_url_for "$slug" "$port")"
-  url_host "$url"
+  local_host_for "$1"
 }
 
-# RAILS_DEVELOPMENT_HOSTS value for a box's dev server. Keep the canonical
-# Tailscale host exact, and also allow the mnemonic per-box OrbStack hostname.
+# RAILS_DEVELOPMENT_HOSTS value for a box's dev server. Rails and Discourse use
+# the per-box OrbStack hostname as canonical, with Tailscale as a secondary host.
 dev_hosts_for() {
-  local slug="$1" hosts="" host local_host
-  host="$(tailnet_host || true)"
-  [ -n "$host" ] && hosts="$host"
-  local_host="$(local_host_for "$slug")"
-  case ",$hosts," in
-    *",$local_host,"*) ;;
-    *) hosts="${hosts:+$hosts,}$local_host" ;;
-  esac
-  printf '%s' "$hosts"
+  printf '%s,%s' "$(local_host_for "$1")" "$TAILNET_HOST"
 }
 
 url_host() { printf '%s' "$1" | sed -E 's#^https?://([^:/]+).*#\1#'; }
@@ -636,10 +702,16 @@ port_free_on_host() { ! lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN >/dev/null 2>
 ts_port_for() {
   local slug="$1" pf
   pf="$DBOX_DIR/state/$slug/tailnet-port"
-  if [ -f "$pf" ]; then cat "$pf"; return; fi
+  if [ -f "$pf" ]; then
+    if [ "$(cat "$pf")" != "$APP_PORT" ]; then cat "$pf"; return; fi
+    unexpose_box "$slug"
+    remove_tailnet_proxy "$slug"
+    rm -f "$pf"
+  fi
   local used p
   used="$(ts_served_ports)"
   for p in $(seq "$TS_BASE_PORT" $((TS_BASE_PORT+99))); do
+    [ "$p" = "$APP_PORT" ] && continue
     printf '%s\n' "$used" | grep -qx "$p" && continue
     grep -rqsx "$p" "$DBOX_DIR"/state/*/tailnet-port 2>/dev/null && continue
     port_free_on_host "$p" || continue
@@ -723,16 +795,16 @@ apply_copy_manifest() {
 
 # tell the agents (claude + codex) the box's own URL, via files they read by default
 write_url_context() {
-  local cname="$1" url local_url
+  local cname="$1" url tailnet_url
   assert_url_contract "$cname"
   url="$(app_url_for "$cname")"
-  local_url="$(local_url_for "$cname")"
+  tailnet_url="$(tailnet_url_for "$cname" || true)"
   local note="# d-box environment
 
 This is a disposable Discourse dev box. The running app is served at: ${url}
 - Admin UI: ${url}/admin
 - Logged in as admin user \`${ADMIN_USER:-admin}\` (also reachable via ${url}/session/${ADMIN_USER:-admin}/become).
-- Local shortcut: ${local_url}
+- Secondary tailnet URL: ${tailnet_url:-unavailable}
 - Use this base URL for any browser/Playwright navigation in this box — NOT localhost.
 - The same value is in the \$DBOX_APP_URL environment variable."
   printf '%s\n' "$note" | docker exec -i -u discourse:discourse -e HOME=/home/discourse "$cname" \
@@ -843,6 +915,7 @@ cmd_new() {
   ensure_restart_policy "$cname"
   wait_pg "$cname"
 
+  sync_codex_config "$cname" "$seed"
   sync_codex_auth "$cname" "$seed"
   sync_claude_auth "$cname" "$seed"
   patch_playwright_mcp_configs "$cname"
@@ -933,7 +1006,9 @@ cmd_claude() {
   ensure_running "$cname"
   sync_claude_auth "$cname" "$DBOX_DIR/state/$cname/seed"
   patch_playwright_mcp_configs "$cname"
+  write_url_context "$cname"
   exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
+    -e "DBOX_APP_URL=$(app_url_for "$cname")" \
     "$cname" claude --dangerously-skip-permissions "$@"
 }
 
@@ -943,10 +1018,32 @@ cmd_codex() {
   [ -n "$branch" ] || die "no box given and no default set (d-box use <box>)"
   local cname="$(slugify "$branch")"
   ensure_running "$cname"
+  sync_codex_config "$cname" "$DBOX_DIR/state/$cname/seed"
   sync_codex_auth "$cname" "$DBOX_DIR/state/$cname/seed"
   patch_playwright_mcp_configs "$cname"
-  exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
+  write_url_context "$cname"
+  local codex_env=(-e HOME=/home/discourse -e "DBOX_APP_URL=$(app_url_for "$cname")")
+  if [ -n "${GITHUB_PAT:-}" ]; then
+    codex_env+=(-e "GITHUB_PAT=$GITHUB_PAT")
+  fi
+  exec docker exec -it -u discourse:discourse -w /src "${codex_env[@]}" \
     "$cname" codex --dangerously-bypass-approvals-and-sandbox "$@"
+}
+
+cmd_update_codex() {
+  [ $# -le 1 ] || die "usage: d-box update-codex [box]"
+  local branch="${1:-}" cname before after
+  [ -n "$branch" ] || branch="$(box_from_worktree_cwd)"
+  [ -n "$branch" ] || branch="$(current_box)"
+  [ -n "$branch" ] || die "no box inferred from cwd and no default set — pass a box name"
+  cname="$(slugify "$branch")"
+  ensure_running "$cname"
+
+  before="$(docker exec "$cname" codex --version)"
+  echo "==> updating Codex in $cname ($before)"
+  docker exec -u root "$cname" npm install -g @openai/codex@latest
+  after="$(docker exec "$cname" codex --version)"
+  echo "==> $cname now has $after"
 }
 
 cmd_imgpaste() {
@@ -1040,7 +1137,9 @@ APPLESCRIPT
 cmd_shell() {
   local cname; cname="$(slugify "$(need_box "${1:-}")")"
   ensure_running "$cname"
-  exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse "$cname" bash -l
+  exec docker exec -it -u discourse:discourse -w /src -e HOME=/home/discourse \
+    -e "DBOX_APP_URL=$(app_url_for "$cname")" \
+    -e "RAILS_DEVELOPMENT_HOSTS=$(dev_hosts_for "$cname")" "$cname" bash -l
 }
 
 # d-box rails [box]            -> interactive rails console
@@ -1301,6 +1400,7 @@ cmd_repair() {
   fi
   docker rm -f "$cname" >/dev/null 2>&1 || true
   echo "   recreating with the stable ssh-agent mount"
+  sync_codex_config "" "$seed"
   sync_codex_auth "" "$seed"
   sync_claude_auth "" "$seed"
   local tailport=""
@@ -1335,7 +1435,6 @@ cmd_url() {
   container_exists "$cname" || die "no box '$cname' — run: d-box new <branch>"
   assert_url_contract "$cname"
   echo "app:     $(app_url_for "$cname")"
-  echo "local:   $(local_url_for "$cname")"
   expose_box "$cname"
 }
 
@@ -1393,6 +1492,10 @@ cmd_auth() {
   sync_codex_auth_all
 }
 
+cmd_config() {
+  sync_codex_config_all
+}
+
 # set or show the default ("current") box
 cmd_use() {
   local branch="${1:-}"
@@ -1420,14 +1523,14 @@ cmd_list() {
   fi
   if [ -n "$names" ]; then
     {
-      printf ' \tNAME\tSTATUS\tAPP\tLOCAL\n'
+      printf ' \tNAME\tSTATUS\tAPP\tTAILNET\n'
       while IFS= read -r n; do
         [ -n "$n" ] || continue
-        local m st app local_url; m=" "; [ "$n" = "$cur" ] && m="*"
+        local m st app tailnet_url; m=" "; [ "$n" = "$cur" ] && m="*"
         st="$(docker ps -a --filter "name=^${n}$" --format '{{.Status}}' 2>/dev/null | head -1)"
         app="$(app_url_for "$n")"
-        local_url="$(local_url_for "$n")"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$n" "$st" "$app" "$local_url"
+        tailnet_url="$(tailnet_url_for "$n" || true)"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$n" "$st" "$app" "${tailnet_url:--}"
       done <<< "$names"
     } | column -t -s $'\t'
   else
@@ -1595,6 +1698,7 @@ d-box — disposable Claude + Codex sandbox boxes
   d-box use   [box]                 set (or, with no arg, show) the default box
   d-box claude [box] [args...]      launch YOLO claude inside the box (pass -c/--resume to continue a session)
   d-box codex  [box] [args...]      launch full-bypass codex inside the box
+  d-box update-codex [box]          update Codex; infer box from worktree cwd
   d-box imgpaste [box]              save the host clipboard image in the box's tmp directory
   d-box shell  [box]                bash prompt inside the box
   d-box rails  [box] ["ruby"]       rails console (or run ruby in the rails env)
@@ -1611,6 +1715,7 @@ d-box — disposable Claude + Codex sandbox boxes
   d-box list (or ls)                list boxes (with URLs, * = default) + worktrees
   d-box rm    [box] [--delete-branch]   tear down box, volumes, worktree, seed
   d-box auth                        push host claude+codex auth into all seeds + boxes
+  d-box config                      refresh sanitized Codex config in all seeds + boxes
 
   d-box snapshot [box] [name]       save a box's state (DB + system) as a reusable image
   d-box snapshots                   list snapshots + the active base
@@ -1619,7 +1724,7 @@ d-box — disposable Claude + Codex sandbox boxes
 
 files listed in $DBOX_DIR/copy-files are copied into every new box (see that file's comments)
 
-env (via $DBOX_DIR/.env): DBOX_IMAGE, DBOX_BASE, DBOX_REPO, DBOX_BASE_BRANCH, DBOX_DISCOURSE_MCP, DBOX_PLAYWRIGHT_MCP, DBOX_GITHUB_SSH_KEY, DBOX_TS_BASE_PORT
+env (via $DBOX_DIR/.env): DBOX_IMAGE, DBOX_BASE, DBOX_REPO, DBOX_BASE_BRANCH, DBOX_DISCOURSE_MCP, DBOX_PLAYWRIGHT_MCP, DBOX_GITHUB_SSH_KEY, GITHUB_PAT, DBOX_TS_BASE_PORT
 EOF
 }
 
@@ -1629,6 +1734,7 @@ case "$cmd" in
   new)    cmd_new "$@" ;;
   claude) cmd_claude "$@" ;;
   codex)  cmd_codex "$@" ;;
+  update-codex|codex-update) cmd_update_codex "$@" ;;
   imgpaste) cmd_imgpaste "$@" ;;
   shell)  cmd_shell "$@" ;;
   rails|console) cmd_rails "$@" ;;
@@ -1643,6 +1749,7 @@ case "$cmd" in
   logs)   cmd_logs "$@" ;;
   url)    cmd_url "$@" ;;
   auth)   cmd_auth "$@" ;;
+  config) cmd_config "$@" ;;
   use|select) cmd_use "$@" ;;
   snapshot|snap) cmd_snapshot "$@" ;;
   snapshots|snaps) cmd_snapshots "$@" ;;

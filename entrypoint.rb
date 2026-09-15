@@ -32,6 +32,9 @@ def install_dev_service
       cd /src
       export HOME=/home/discourse
       export UNICORN_BIND_ALL=true
+      export RAILS_DEVELOPMENT_HOSTS="$(hostname).orb.local,steakbookpro.great-flops.ts.net"
+      export DISCOURSE_HOSTNAME="$(hostname).orb.local"
+      export DBOX_APP_URL="http://$(hostname).orb.local:3000"
       export DISCOURSE_DEV_ALLOW_ANON_TO_IMPERSONATE=1
 
       # runsv starts services concurrently. Do not let Rails race the database
